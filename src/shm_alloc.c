@@ -622,6 +622,50 @@ static void region_unlock(shm_region_t *r)
     pthread_mutex_unlock(&region_hdr(r)->mutex);
 }
 
+/*
+ * Read the capacity of a Linux device-DAX node from sysfs.
+ *
+ * /dev/daxX.Y is a character device: fstat(2).st_size is not the memory
+ * capacity (often 0).  The size in bytes is published as a decimal string at:
+ *   /sys/bus/dax/devices/daxX.Y/size   (current kernel)
+ *   /sys/class/dax/daxX.Y/size         (legacy compat driver)
+ *
+ * Returns 0 if the size cannot be determined.
+ */
+static size_t dax_device_size_bytes(const char *dev_path)
+{
+    const char *base = strrchr(dev_path, '/');
+    base = base ? base + 1 : dev_path;
+    if (base[0] == '\0')
+        return 0;
+
+    static const char *const patterns[] = {
+        "/sys/bus/dax/devices/%s/size",
+        "/sys/class/dax/%s/size",
+        NULL
+    };
+
+    for (int i = 0; patterns[i] != NULL; i++) {
+        char sysfs_path[256];
+        if (snprintf(sysfs_path, sizeof(sysfs_path), patterns[i], base)
+                >= (int)sizeof(sysfs_path))
+            continue;
+
+        FILE *fp = fopen(sysfs_path, "r");
+        if (!fp)
+            continue;
+
+        unsigned long long val = 0;
+        int n = fscanf(fp, "%llu", &val);
+        fclose(fp);
+
+        if (n == 1 && val >= 4096)
+            return (size_t)val;
+    }
+
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Public API: region lifecycle
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -693,12 +737,22 @@ int shm_region_open(const char                   *name_or_path,
             return err;
         }
         if (size < 4096) {
-            /* Try to get the device size from stat. */
-            struct stat st;
-            if (fstat(reg->fd, &st) == 0 && st.st_size > 0)
-                size = (size_t)st.st_size;
-            else
-                size = 2u << 20;  /* default 2 MB if device size is unknown */
+            /* Character device: read capacity from sysfs, not fstat. */
+            size = dax_device_size_bytes(name_or_path);
+            if (size < 4096) {
+                struct stat st;
+                if (fstat(reg->fd, &st) == 0 && (size_t)st.st_size >= 4096)
+                    size = (size_t)st.st_size;
+            }
+            if (size < 4096) {
+                fprintf(stderr,
+                        "shm_alloc: cannot determine size of DAX device '%s' "
+                        "(try: cat /sys/bus/dax/devices/<name>/size)\n",
+                        name_or_path);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return ENODEV;
+            }
         }
     }
 
