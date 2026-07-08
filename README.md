@@ -15,18 +15,161 @@ Parts of this program is vibe coded.
 
 ## Memory layout
 
+The mapping is split into three contiguous zones.  `dir_offset` and
+`data_offset` are written into the region header at creation time, so a new
+host process can find everything by reading just those two fields.
+
 ```
-base[0]              dir_offset               data_offset
-  │                      │                         │
-  ▼                      ▼                         ▼
-┌──────────────────┬──────────────────────────┬────────────────────────┐
-│  region header   │   object directory       │   heap (blocks…)       │
-└──────────────────┴──────────────────────────┴────────────────────────┘
+byte 0                 +0x0000c8              +0x0060c8
+  │                        │                      │
+  ▼                        ▼                      ▼
+┌────────────────────┬──────────────────────┬───────────────────────────┐
+│   region header    │   object directory   │   heap (blocks…)          │
+│      200 B         │  N × 96 B each       │  region_size − data_offset│
+└────────────────────┴──────────────────────┴───────────────────────────┘
 ```
 
-`dir_offset` and `data_offset` are stored in the region header, so the layout
-is **self-describing**. A new host only needs to open the same name / device
-and read those two fields.
+**Default offsets for a 1 MiB region with 256 directory slots:**
+
+```
+  [0x000000 – 0x0000c8)  region header         200 B
+  [0x0000c8 – 0x0060c8)  object directory    24 576 B   (256 × 96 B)
+  [0x0060c8 – 0x100000)  heap             1 023 800 B
+```
+
+---
+
+## Permission and ownership layout
+
+Security fields are marked `◀ SECURITY` in each diagram.
+All sizes are for x86-64 Linux (LP64 ABI).
+
+### Region header — `shm_region_hdr_t`  (200 bytes total)
+
+Holds identity, locking, and **namespace / cgroup fingerprints** used for
+cross-host access control.
+
+```
+ Offset  Size  Field
+──────────────────────────────────────────────────────────────────────────
+   +0      4   magic          0x53484D41 ("SHMA") — corruption guard
+   +4      4   version        format version; reject mismatch on open
+   +8      4   backend        0 = POSIX shm_open  /  1 = DAX /dev/daxX.Y
+  +12      4   dir_capacity   max slots in the object directory
+  +16     40   mutex          process-shared robust pthread_mutex_t
+                              (locked for every alloc / free / resize)
+  +56      4   host_count     number of processes currently attached
+  +60      4   (pad)
+  +64      8   region_size    total mapping size in bytes
+  +72      8   dir_offset     byte offset of object directory from base
+  +80      8   data_offset    byte offset of heap start from base
+  +88      8   free_list      1-based hoff link to first free heap block
+  +96      8   used_bytes     bytes committed to live blocks
+ +104      8   block_count    number of live heap blocks
+ +112      8   next_id        next monotonic object ID (starts at 1)
+ +120      8   ns_inode     ◀ SECURITY — IPC namespace inode of creator
+                              checked when SHM_OPEN_ENFORCE_NS is set;
+                              EPERM if caller's /proc/self/ns/ipc differs
+ +128      8   cgroup_hash  ◀ SECURITY — FNV-1a hash of creator's
+                              /proc/self/cgroup; checked when
+                              SHM_OPEN_ENFORCE_CGROUP is set
+ +136     64   shm_name       the name / path used at creation (debug)
+──────────────────────────────────────────────────────────────────────────
+          200  total
+```
+
+### Directory entry — `shm_obj_entry_t`  (96 bytes per slot)
+
+One slot per live object.  Permission checks for `shm_lookup()`,
+`shm_free()`, and `shm_resize()` all start here before the heap block
+is touched.
+
+```
+ Offset  Size  Field
+──────────────────────────────────────────────────────────────────────────
+   +0      8   id           monotonic uint64_t; 0 = slot is free
+   +8     48   name[48]     optional human-readable name (NUL-padded)
+  +56      8   off          heap-relative payload offset (shm_off_t)
+  +64      8   capacity     physical payload bytes allocated
+  +72      8   used_size    logical bytes in use (updated by shm_resize)
+  +80      4   type_tag     caller-defined type identifier
+  +84      4   owner      ◀ SECURITY — shm_user_id_t (uint32_t) of the
+                            process that called shm_alloc(); must match
+                            the caller's user_id on every mutation unless
+                            the caller supplies SHM_PERM_ADMIN
+  +88      4   perms      ◀ SECURITY — shm_perm_t bitmask stored on
+                            the object; each operation checks that the
+                            required bit is set here AND in the caller's
+                            own perm argument before proceeding
+  +92      1   alive        1 = live object; 0 = freed / reusable slot
+  +93      3   (pad)
+──────────────────────────────────────────────────────────────────────────
+          96   total
+```
+
+### Heap block header — `shm_block_hdr_t`  (56 bytes)
+
+Lives immediately before every payload in the heap.  Fields are a
+**redundant copy** of the directory entry's security fields so that
+`shm_ptr()` can validate a raw offset without a directory scan.
+
+```
+ Offset  Size  Field
+──────────────────────────────────────────────────────────────────────────
+   +0      4   magic        0x424C4B21 ("BLK!") — detects corrupt/wrong offset
+   +4      4   type_tag     copy of directory entry's type_tag
+   +8      4   owner      ◀ SECURITY — copy of directory entry's owner;
+                            shm_ptr() compares this against caller's user_id
+  +12      4   perms      ◀ SECURITY — copy of directory entry's perms;
+                            shm_ptr() ANDs required_perms against this mask
+  +16      1   allocated  ◀ SECURITY — 1 = live, 0 = on free list;
+                            shm_ptr() returns NULL if this is 0 (use-after-free guard)
+  +17      7   (pad)        keeps obj_id on an 8-byte boundary
+  +24      8   obj_id       directory entry ID; 0 for free blocks
+  +32      8   payload_cap  physical payload bytes (excl. this header)
+  +40      8   total_size   sizeof(header) + payload_cap; used by the heap
+  +48      8   next_free    1-based hoff of next free block; 0 = end of list
+──────────────────────────────────────────────────────────────────────────
+          56   total
+```
+
+### Permission bitmask — `shm_perm_t`  (uint32_t, 4 bytes)
+
+```
+ Bit   Hex    Constant          Required by
+──────────────────────────────────────────────────────────────────────────
+   0  0x01   SHM_PERM_READ     shm_ptr()          (read access)
+   1  0x02   SHM_PERM_WRITE    shm_ptr()          (write access)
+   2  0x04   SHM_PERM_FREE     shm_free()
+   3  0x08   SHM_PERM_RESIZE   shm_resize()
+ 4–6   —     (reserved)
+   7  0x80   SHM_PERM_ADMIN    bypass owner-id check on all operations
+ 8–31  —     (reserved)
+──────────────────────────────────────────────────────────────────────────
+  0x0F  SHM_PERM_DEFAULT  = READ | WRITE | FREE | RESIZE
+```
+
+### Check flow for every data-plane operation
+
+```
+caller supplies:  user_id  +  caller_perms  +  required_perms
+                       │            │                  │
+                       ▼            ▼                  ▼
+              ┌────────────────────────────────────────────────┐
+              │  1. block->magic == SHM_ALLOC_MAGIC_BLOCK?     │ → EINVAL
+              │  2. block->allocated == 1?                     │ → EINVAL
+              │  3. caller_perms & SHM_PERM_ADMIN?             │ → PASS (skip 4–6)
+              │  4. user_id == block->owner?                   │ → EACCES
+              │  5. (block->perms & required) == required?     │ → EACCES
+              │  6. (caller_perms & required) == required?     │ → EACCES
+              └────────────────────────────────────────────────┘
+                                    │ all pass
+                                    ▼
+                          return payload pointer
+```
+
+`shm_free()` and `shm_resize()` run the same check via the directory entry
+**before** touching any heap block, giving a second layer of validation.
 
 ---
 
@@ -203,6 +346,156 @@ shm_region_open("/my_pool", 0, &opts, &region);
 | 0x80 | `SHM_PERM_ADMIN`  | bypass owner-id check |
 
 Both the **block's stored perms** and the **caller's perms** must contain the required bits.
+
+---
+
+## Comparison with CHERI capability pointers
+
+[CHERI](https://www.cl.cam.ac.uk/research/security/ctsrd/cheri/) (Capability
+Hardware Enhanced RISC Instructions) is a hardware ISA extension that replaces
+raw pointers with *capabilities* — hardware-tagged, bounds-checked, permission-
+bearing tokens that cannot be forged or widened by software.
+
+`shm_alloc` reaches for many of the same safety properties in *software*, applied
+to shared / disaggregated memory rather than a single address space.  The
+comparison is instructive for understanding what the allocator does, what it
+intentionally omits, and where the two models diverge.
+
+---
+
+### Side-by-side field mapping
+
+A 128-bit CHERI capability (morello / RISC-V Cheriot layout, compressed) next to
+the fields that form our "software capability" — the `shm_off_t` handle backed
+by a `shm_block_hdr_t` and a `shm_obj_entry_t`.
+
+```
+┌─────────────────────────────────────────┬──────────────────────────────────────────────┐
+│       CHERI capability  (128-bit)       │  shm_alloc software capability               │
+│                                         │  handle (shm_off_t, 8 B)                     │
+│                                         │  + block header (56 B)                       │
+│                                         │  + directory entry (96 B)                    │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Tag bit (1, hardware-maintained)        │ block->allocated (uint8_t, +16 in hdr)       │
+│   0 = invalid / revoked capability      │   0 = block is on free list (revoked)        │
+│   1 = valid, may be used as a pointer   │   1 = block is live, shm_ptr() will proceed  │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Address / cursor (64-bit)               │ shm_off_t  (heap-relative payload offset)    │
+│   current pointer value within bounds  │   process-neutral; re-based per mmap         │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Base  (compressed in capability)        │ heap_base(region) + off − sizeof(hdr)        │
+│   lowest valid address                  │   block header address (start of allocation) │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Top / Length  (compressed in cap.)      │ block->payload_cap  (+32 in hdr, 8 B)        │
+│   upper bound = base + length           │   payload bytes; shm_ptr never returns a ptr │
+│                                         │   past base + payload_cap                    │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Permissions  (hardware-defined bits)    │ block->perms  shm_perm_t  (+12 in hdr, 4 B) │
+│   LOAD / STORE / EXECUTE /              │   READ / WRITE / FREE / RESIZE / ADMIN       │
+│   LOAD_CAP / STORE_CAP / SEAL /…        │   (two-party check: block AND caller)        │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Object type  (otype, sealed caps only)  │ block->type_tag  (+4 in hdr, 4 B)           │
+│   software-defined sealed type token    │   shm::cast_dyn<To>() checks this before     │
+│   prevents direct dereference; must     │   dynamic_cast; sizeof(T) default or custom  │
+│   be unsealed via matching otype cap    │   protocol enum                              │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ (no concept of owner identity)          │ block->owner  shm_user_id_t  (+8, 4 B)      │
+│                                         │   uint32_t set at alloc time; caller must    │
+│                                         │   match or hold SHM_PERM_ADMIN               │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ (no OS-level containment)               │ region_hdr->ns_inode  (+120, 8 B)           │
+│                                         │ region_hdr->cgroup_hash  (+128, 8 B)        │
+│                                         │   Linux namespace / cgroup fingerprints;     │
+│                                         │   checked on shm_region_open() when          │
+│                                         │   enforcement flags are set                  │
+├─────────────────────────────────────────┼──────────────────────────────────────────────┤
+│ Integrity: hardware tag (unforgeable)   │ block->magic  0x424C4B21  (+0, 4 B)         │
+│   CPU refuses to use a capability whose │   shm_ptr() returns NULL on mismatch;        │
+│   tag was not set by a store-cap instr  │   software-only; a malicious writer can      │
+│                                         │   still fake the magic (see Differences)     │
+└─────────────────────────────────────────┴──────────────────────────────────────────────┘
+```
+
+---
+
+### Where `shm_alloc` mirrors CHERI
+
+**Opaque, non-address handle.**
+In CHERI, application code never manipulates raw addresses; it derives new
+capabilities from existing ones.  In `shm_alloc`, application code never forms
+a raw pointer — it calls `shm_ptr()` (or a typed wrapper) which re-validates on
+every dereference.  The `shm_off_t` is an integer, not an address; process A and
+process B get different virtual addresses for the same object, just as CHERI
+addresses are relative to base.
+
+**Bounds enforcement.**
+CHERI hardware traps any load/store outside `[base, base+length)`.
+`shm_alloc` encodes bounds in `block->payload_cap` and will only return a
+pointer to the payload region; out-of-bounds offsets produce a NULL.
+
+**Permission narrowing.**
+Both systems store permission bits on the capability itself, not only on the
+page table.  CHERI disallows widening permissions (you can only clear bits from
+a derived capability).  `shm_alloc` enforces this at the API level: `shm_ptr()`
+requires the caller to declare what permissions they need, and checks those
+against both the block's stored mask and the caller's supplied mask.
+
+**Liveness / revocation.**
+CHERI's tag bit becomes 0 when a capability is invalidated.  The `allocated`
+byte in the block header plays the same role: when a block is freed it is set to
+0, and any subsequent call to `shm_ptr()` with the same offset returns NULL,
+preventing use-after-free through stale `shm_off_t` values.
+
+**Type sealing.**
+CHERI sealed capabilities cannot be directly dereferenced; they carry an object
+type token and must be unsealed by code that holds a matching sealing capability.
+`type_tag` plus `shm::cast_dyn<T>()` approximate this: a mismatch between the
+stored tag and `type_tag_of<T>()` aborts the cast, guarding against aliasing
+between objects that happen to share the same heap offset over time.
+
+**Two-party permission check.**
+CHERI checks capability permissions at hardware level *and* honours the CPU
+privilege ring.  `shm_alloc` checks two independent permission words on every
+operation: `block->perms` (set by the allocator at creation time) and
+`caller_perms` (provided by the calling code at dereference time).  Both must
+contain the required bits — analogous to needing both a valid capability and
+sufficient privilege ring.
+
+---
+
+### Where `shm_alloc` diverges from CHERI
+
+| Dimension | CHERI | `shm_alloc` |
+|-----------|-------|-------------|
+| **Enforcement** | Hardware; cannot be bypassed by any software | Software; a process with write access to the mapping can corrupt headers |
+| **Granularity** | Every load/store instruction is checked | Checked at allocator API boundaries only |
+| **Unforgeability** | Tag bit is writable only by capability-store instructions; integer stores always clear it | `magic` field is an integrity hint, not a cryptographic guarantee |
+| **Sub-object bounds** | Can restrict a capability to a field within a struct | No sub-object bounds; the unit is always the whole heap block |
+| **Monotonic IDs** | No native concept; capabilities can be reused across objects | `next_id` is never decremented; a stale ID after free returns `ENOENT`, not a dangling reference |
+| **Multi-host identity** | No concept of "which machine" holds a capability | `ns_inode` + `cgroup_hash` add Linux-level containment across hosts sharing a DAX device |
+| **Owner identity** | No per-capability owner; access governed by sealing and permissions alone | `shm_user_id_t owner` adds a discretionary access layer on top of permissions |
+| **Sharing model** | Capability can be passed between compartments as a value | `shm_off_t` is a plain integer; any process with the fd can open the same region, access control then applies |
+
+---
+
+### The gap that matters most
+
+The fundamental difference is **trust model**.  A CHERI CPU refuses to execute
+any memory operation that does not originate from a valid tagged capability —
+there is no way for software running at user privilege to forge one.
+
+In `shm_alloc`, the region is a `mmap`-backed file.  Any process holding the
+file descriptor and sufficient OS permissions can write arbitrary bytes into the
+mapping, overwriting magic values, forging permission masks, or clearing the
+`allocated` flag.  The allocator's checks protect against *accidental* misuse
+(wrong type, stale offset, access by the wrong user) but not against a
+*malicious* co-tenant.
+
+Combining `shm_alloc` with OS-level isolation — separate cgroups, separate IPC
+namespaces (`SHM_OPEN_ENFORCE_NS`), and filesystem permissions on `/dev/shm` or
+the DAX device — closes most of this gap for the disaggregated-memory use case,
+where the threat model is node failure and buggy code rather than active
+adversaries sharing the same physical hardware.
 
 ---
 
