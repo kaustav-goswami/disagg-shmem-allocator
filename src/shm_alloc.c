@@ -101,6 +101,9 @@ static int check_dir_access(const shm_obj_entry_t *e,
  * Insert block @p b into the address-ordered free list and coalesce with
  * adjacent free blocks.  Maintains ascending address order so coalescing can
  * be done in a single pass.
+ *
+ * Every struct field modified here is persisted before returning so that other
+ * hosts see a consistent free list even after a crash mid-operation.
  */
 static void freelist_insert(shm_region_t *r, shm_block_hdr_t *b)
 {
@@ -140,6 +143,7 @@ static void freelist_insert(shm_region_t *r, shm_block_hdr_t *b)
             b->total_size += cur->total_size;  /* absorb cur's size into b */
             b->next_free   = cur->next_free;
             cur->magic     = 0;                /* poison the merged block */
+            shm_persist(cur, sizeof(*cur));    /* persist poisoned successor */
         }
     }
 
@@ -151,8 +155,19 @@ static void freelist_insert(shm_region_t *r, shm_block_hdr_t *b)
             prev->total_size += b->total_size;
             prev->next_free   = b->next_free;
             b->magic          = 0;             /* poison the merged block */
+            shm_persist(b, sizeof(*b));        /* persist poisoned b before prev */
+            shm_persist(prev, sizeof(*prev));  /* persist coalesced predecessor */
+            return;                            /* b is now part of prev; done */
         }
+        /* Predecessor was not merged; persist its updated next_free link. */
+        shm_persist(prev, sizeof(*prev));
+    } else {
+        /* free_list head was updated; persist the region header field. */
+        shm_persist(&rh->free_list, sizeof(rh->free_list));
     }
+
+    /* Persist the newly inserted (and possibly forward-coalesced) block b. */
+    shm_persist(b, sizeof(*b));
 }
 
 /**
@@ -221,6 +236,9 @@ static shm_block_hdr_t *heap_alloc_block(shm_region_t *r, size_t need_total)
                 b->total_size    = need_total;
                 b->payload_cap   = need_total - sizeof(shm_block_hdr_t);
 
+                /* Persist the split remainder before linking it into the list. */
+                shm_persist(nb, sizeof(*nb));
+
                 /* Replace b in the free list with the new split block. */
                 uint64_t nb_lnk = shm_link_enc(shm_hoff_of_blk(r, nb));
                 if (prev_lnk == 0)
@@ -239,6 +257,13 @@ static shm_block_hdr_t *heap_alloc_block(shm_region_t *r, size_t need_total)
             b->next_free  = 0;
             rh->used_bytes  += b->total_size;
             rh->block_count += 1;
+
+            /* Persist the allocated block header and the updated region counters
+             * and free-list head before returning to the caller. */
+            shm_persist(b, sizeof(*b));
+            shm_persist(&rh->free_list,
+                        sizeof(rh->free_list) + sizeof(rh->used_bytes)
+                        + sizeof(rh->block_count));
             return b;
         }
 
@@ -363,6 +388,12 @@ static void region_init(shm_region_t *r, size_t total_size,
     initial->next_free   = 0;          /* only block; no successor */
 
     rh->free_list = shm_link_enc(0);   /* hoff=0 → link=1 */
+
+    /* Persist the entire initialized region header, directory (already zeroed
+     * by memset, but the persist makes the zeroes visible past the cache), and
+     * the first block header so other hosts see a complete initial state.      */
+    shm_persist(r->base, data_off + sizeof(shm_block_hdr_t));
+    shm_drain();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -505,6 +536,8 @@ int shm_region_open(const char                   *name_or_path,
 
     region_lock(reg);
     shm_rh(reg)->host_count++;
+    shm_persist(&shm_rh(reg)->host_count, sizeof(shm_rh(reg)->host_count));
+    shm_drain();
     region_unlock(reg);
 
     *out_region = reg;
@@ -516,8 +549,12 @@ void shm_region_close(shm_region_t *region, bool unlink_name)
     if (!region) return;
     if (region->base) {
         region_lock(region);
-        if (shm_rh(region)->host_count > 0)
+        if (shm_rh(region)->host_count > 0) {
             shm_rh(region)->host_count--;
+            shm_persist(&shm_rh(region)->host_count,
+                        sizeof(shm_rh(region)->host_count));
+            shm_drain();
+        }
         region_unlock(region);
         munmap(region->base, region->size);
     }
@@ -581,6 +618,13 @@ int shm_alloc(shm_region_t  *region,
 
     memset((char *)b + sizeof(shm_block_hdr_t), 0, b->payload_cap);
 
+    /* Persist the zero-initialized payload before exposing the live block.
+     * Other hosts must not see uninitialized bytes through a capability or ptr. */
+    shm_persist((char *)b + sizeof(shm_block_hdr_t), b->payload_cap);
+
+    /* Persist the completed block header (includes the allocated/tag bit). */
+    shm_persist(b, sizeof(*b));
+
     memset(slot, 0, sizeof(*slot));
     slot->id        = new_id;
     slot->off       = shm_poff_of_blk(region, b);
@@ -592,6 +636,15 @@ int shm_alloc(shm_region_t  *region,
     slot->alive     = 1;
     if (name && name[0] != '\0')
         strncpy(slot->name, name, DIR_NAME_MAX - 1);
+
+    /* Persist the directory entry so other hosts can discover the object. */
+    shm_persist(slot, sizeof(*slot));
+
+    /* Persist the region header field next_id (advanced by this allocation). */
+    shm_persist(&shm_rh(region)->next_id, sizeof(shm_rh(region)->next_id));
+
+    /* Issue the store fence; all prior persists are now ordered. */
+    shm_drain();
 
     *out_id  = new_id;
     *out_off = slot->off;
@@ -626,8 +679,11 @@ int shm_free(shm_region_t *region,
     }
 
     shm_block_hdr_t *b = shm_blk_of_poff(region, slot->off);
-    heap_free_block(region, b);        /* clears allocated (tag bit) and links */
+    heap_free_block(region, b);        /* clears allocated (tag bit), links, persists */
+
     memset(slot, 0, sizeof(*slot));    /* clear directory entry */
+    shm_persist(slot, sizeof(*slot));  /* persist the cleared slot */
+    shm_drain();                       /* ordering fence */
 
     region_unlock(region);
     return 0;
@@ -681,10 +737,15 @@ int shm_resize(shm_region_t *region,
             rh->used_bytes -= rem;
             b->total_size   = new_total;
             b->payload_cap  = new_total - sizeof(shm_block_hdr_t);
-            freelist_insert(region, tail);
+
+            /* Persist the resized block header before inserting the tail fragment
+             * into the free list so the new bounds are visible atomically.      */
+            shm_persist(b, sizeof(*b));
+            freelist_insert(region, tail);   /* freelist_insert persists tail + rh */
         }
         slot->capacity  = b->payload_cap;
         slot->used_size = new_size;
+        shm_persist(slot, sizeof(*slot));   /* persist updated directory entry */
 
     } else {
         /* ── Grow ── */
@@ -703,6 +764,7 @@ int shm_resize(shm_region_t *region,
                     b->total_size   = combined;
                     b->payload_cap  = combined - sizeof(shm_block_hdr_t);
                     next->magic     = 0;
+                    shm_persist(next, sizeof(*next));    /* persist poisoned successor */
 
                     size_t leftover = combined - new_total;
                     if (leftover >= BLOCK_MIN) {
@@ -719,8 +781,13 @@ int shm_resize(shm_region_t *region,
                         rh->used_bytes   -= leftover;
                         b->total_size     = new_total;
                         b->payload_cap    = new_total - sizeof(shm_block_hdr_t);
+                        /* Persist b before inserting tail; callers see new bounds. */
+                        shm_persist(b, sizeof(*b));
                         freelist_insert(region, tail);
+                    } else {
+                        shm_persist(b, sizeof(*b));      /* persist grown block header */
                     }
+                    shm_persist(&rh->used_bytes, sizeof(rh->used_bytes));
                     grew = true;
                 }
             }
@@ -745,15 +812,23 @@ int shm_resize(shm_region_t *region,
             nb->perms    = b->perms;
             nb->obj_id   = b->obj_id;
 
-            heap_free_block(region, b);
+            /* Persist the new block's copied payload + header before updating
+             * the directory, so a reader cannot see the new offset before the
+             * data is durable.                                                */
+            shm_persist((char *)nb + sizeof(shm_block_hdr_t), nb->payload_cap);
+            shm_persist(nb, sizeof(*nb));
+
+            heap_free_block(region, b);     /* frees old block; persists its header */
             slot->off      = shm_poff_of_blk(region, nb);
             slot->capacity = nb->payload_cap;
         } else {
             slot->capacity = b->payload_cap;
         }
         slot->used_size = new_size;
+        shm_persist(slot, sizeof(*slot));   /* persist updated directory entry */
     }
 
+    shm_drain();   /* ordering fence: all block and directory writes are durable */
     region_unlock(region);
     return 0;
 }
@@ -913,11 +988,15 @@ int shm_block_set_perms(shm_region_t *region,
     }
 
     b->perms = new_perms;
+    shm_persist(b, sizeof(*b));                /* persist the updated block perms */
 
     shm_obj_entry_t *slot = dir_find_by_id(region, b->obj_id);
-    if (slot)
+    if (slot) {
         slot->perms = new_perms;
+        shm_persist(slot, sizeof(*slot));      /* persist the updated directory perms */
+    }
 
+    shm_drain();   /* ordering fence */
     region_unlock(region);
     return 0;
 }

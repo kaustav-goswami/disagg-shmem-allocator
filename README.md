@@ -637,6 +637,90 @@ the disaggregated-memory threat model.
 
 ---
 
+## Cache persistence (clflush / clwb / cbo)
+
+By default `shm_alloc` does not issue any cache-flush or write-back
+instructions.  On conventional DRAM-backed shared memory, hardware cache
+coherency makes explicit flushes unnecessary.  On **persistent / disaggregated
+memory** (Intel Optane, CXL PMEM, `/dev/dax`), writes that stay in CPU caches
+will not survive a host crash.
+
+`src/shm_persist.h` provides `shm_persist(addr, len)` and `shm_drain()`.
+The allocator calls these automatically on every internal write — block headers,
+directory entries, and the region header — so metadata is durable without any
+change to user code.  **Users remain responsible for flushing their own payload
+data** after writing it.
+
+### Selecting a mode at compile time
+
+Pass exactly one `CACHE=` value to `make` (or add the corresponding `-D` flag
+directly to your compiler invocation):
+
+```
+make CACHE=CLFLUSH       # x86 / x86-64 — CLFLUSH (flush + invalidate)
+make CACHE=CLFLUSHOPT    # x86 / x86-64 — CLFLUSHOPT (Broadwell+, non-serialising)
+make CACHE=CLWB          # x86 / x86-64 — CLWB write-back (Cannon Lake+)
+make CACHE=CBO_FLUSH     # RISC-V Zicbom — cbo.flush (flush + invalidate)
+make CACHE=CBO_CLEAN     # RISC-V Zicbom — cbo.clean (write-back ≈ CLWB)
+make                     # (default)     — compiler barrier only; no HW ops
+```
+
+Selecting more than one mode, or selecting an x86 mode on a RISC-V target (or
+vice versa), is a **compile-time error** caught by `shm_persist.h`'s
+architecture guards.
+
+### Instruction summary
+
+| Mode | x86 mnemonic | Semantics | Requires SFENCE after? |
+|------|-------------|-----------|------------------------|
+| `CLFLUSH` | `clflush [mem]` | flush + invalidate cache line | no (serialising) |
+| `CLFLUSHOPT` | `clflushopt [mem]` | flush + invalidate (weakly ordered) | **yes** |
+| `CLWB` | `clwb [mem]` | write-back, line stays valid (Modified→Shared) | **yes** |
+
+| Mode | RISC-V mnemonic | Semantics | Requires FENCE after? |
+|------|----------------|-----------|----------------------|
+| `CBO_FLUSH` | `cbo.flush (rs1)` | flush + invalidate cache block | **yes** |
+| `CBO_CLEAN` | `cbo.clean (rs1)` | write-back, block stays valid | **yes** |
+
+`shm_drain()` issues the appropriate fence (`SFENCE` on x86,
+`fence rw, rw` on RISC-V) after a group of persist calls to enforce ordering.
+It is called once at the end of each public API mutation (`shm_alloc`,
+`shm_free`, `shm_resize`, `shm_block_set_perms`).
+
+### Cache line size
+
+The default cache line size is 64 bytes.  Override with:
+
+```
+make CACHE=CLFLUSH EXTRA_CFLAGS="-DSHM_CACHE_LINE_BYTES=128"
+```
+
+### Persist call sites
+
+Every allocator write that must be visible to other hosts is covered:
+
+| Operation | Structs persisted |
+|-----------|------------------|
+| `shm_region_open` (create) | entire region header + directory + initial block |
+| `shm_region_open` (attach) | `host_count` field |
+| `shm_region_close` | `host_count` field |
+| `shm_alloc` | zero-filled payload, block header, directory entry, `next_id` |
+| `shm_free` | block header (via `freelist_insert`), directory entry |
+| `shm_resize` | modified block headers, directory entry, `used_bytes` |
+| `shm_block_set_perms` | block header, directory entry |
+
+### CPU feature requirements
+
+`CLWB` requires CPUID.07H.EBX[bit 24] = 1 (Cannon Lake / Ice Lake and later).  
+`CLFLUSHOPT` requires CPUID.07H.EBX[bit 23] = 1 (Broadwell and later).  
+`cbo.flush` and `cbo.clean` require the RISC-V Zicbom extension.
+
+The allocator **does not check CPU features at runtime** when compiled with a
+specific cache mode — the assumption is that the user has verified the target
+hardware.  An unsupported instruction will raise `SIGILL`.
+
+---
+
 ## File structure
 
 ```
@@ -647,6 +731,7 @@ include/
   shm_cap.hpp      C++ typed capability wrapper (shm::cap<T>)
 src/
   shm_internal.h   Internal layout types + inline helpers (shm_block_hdr_t, …)
+  shm_persist.h    Cache-line flush / write-back helpers (CLFLUSH/CLWB/CBO/none)
   shm_alloc.c      Core allocator (region, heap, directory, resize)
   shm_cap.c        CHERI-like capability layer (derive, deref, validate)
   shm_ns.h         Internal: IPC namespace + cgroup fingerprint declarations

@@ -18,6 +18,7 @@
 #define _POSIX_C_SOURCE 200809L   /* robust mutexes, shm_open */
 
 #include "shm_alloc.h"
+#include "shm_persist.h"   /* shm_persist(), shm_drain(), shm_flush_line() */
 
 #include <pthread.h>   /* pthread_mutex_t */
 #include <stddef.h>    /* size_t, offsetof */
