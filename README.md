@@ -499,19 +499,162 @@ adversaries sharing the same physical hardware.
 
 ---
 
+## CHERI-like capability pointer mode
+
+`shm_alloc` ships an optional capability layer that lets you hold a reference
+to a shared-memory object as a **128-bit software capability** instead of a
+plain `shm_off_t` offset.  Include `shm_cap.h` (C) or `shm_cap.hpp` (C++) and
+link against `shm_cap.o`; existing code that uses `shm_off_t` / `shm_ptr()`
+continues to work unchanged on the same region — the two representations
+coexist at runtime.
+
+### 128-bit capability layout
+
+```
+ 127                  64 63                   0
+┌──────────────────────┬──────────────────────┐
+│       meta           │        addr          │
+│   (high 64 bits)     │   (low  64 bits)     │
+└──────────────────────┴──────────────────────┘
+
+addr  — heap-relative payload offset  (identical to shm_off_t)
+
+meta bit layout:
+
+ 63      56 55      48 47             32 31              0
+┌──────────┬──────────┬────────────────┬──────────────────┐
+│  perms   │ owner_lo │    epoch       │     bounds       │
+│  (8 bit) │  (8 bit) │   (16 bit)     │    (32 bit)      │
+└──────────┴──────────┴────────────────┴──────────────────┘
+```
+
+| Field      | Bits    | Width | Contents                                          |
+|------------|---------|-------|---------------------------------------------------|
+| `perms`    | [63:56] | 8 b   | `shm_perm_t` bits sealed at derive time           |
+| `owner_lo` | [55:48] | 8 b   | Low byte of `shm_user_id_t` (identity hint)       |
+| `epoch`    | [47:32] | 16 b  | Low 16 bits of `obj_id` — ABA protection token   |
+| `bounds`   | [31: 0] | 32 b  | `payload_cap` at derive time — upper access bound |
+
+### The tag bit
+
+The **tag bit** is *not* stored in the capability value itself — it lives in
+the heap block header as `shm_block_hdr_t::allocated`.  Every
+`shm_cap_deref()` call re-reads the live header.  This means that freeing a
+block **immediately** invalidates every outstanding capability that points to
+it — no revocation scan required.
+
+### Validation steps on every dereference
+
+`shm_cap_deref(region, cap, required_perms)` performs seven ordered checks:
+
+1. **Non-null** — `addr != 0 || meta != 0`
+2. **Magic** — `block->magic == SHM_ALLOC_MAGIC_BLOCK` (corruption guard)
+3. **Tag bit** — `block->allocated == 1` (use-after-free detection)
+4. **Epoch / ABA** — `(block->obj_id & 0xFFFF) == meta.epoch`
+5. **Bounds** — `block->payload_cap == meta.bounds` (resize invalidates old caps)
+6. **Capability perms** — `(meta.perms & required) == required`
+7. **Block perms** — `(block->perms & required) == required` (live narrowing)
+
+If any check fails the function returns `NULL`; no exception is thrown.
+
+### Capability monotonicity (narrowing)
+
+```c
+shm_cap_t ro = shm_cap_narrow(rw_cap, SHM_PERM_READ);
+```
+
+`shm_cap_narrow()` removes permission bits — it can never add them.  Passing
+a `new_perms` value with a bit absent from the current capability returns
+`SHM_CAP_NULL`.  This mirrors CHERI's capability monotonicity invariant in
+software.
+
+### C API quick-reference
+
+```c
+#include "shm_cap.h"
+
+/* Derive a capability from an existing allocation. */
+shm_cap_t cap = shm_cap_derive(region, off, uid, caller_perms, grant_perms);
+
+/* Validate + return payload pointer (NULL on any failure). */
+MyObj *p = shm_cap_deref_as(region, cap, MyObj, SHM_PERM_READ | SHM_PERM_WRITE);
+
+/* Narrow to read-only (removes WRITE bit). */
+shm_cap_t ro = shm_cap_narrow(cap, SHM_PERM_READ);
+
+/* Structural validity check (no permission argument). */
+bool live = shm_cap_is_valid(region, cap);
+
+/* Field accessors. */
+shm_perm_t p  = shm_cap_perms(cap);   /* sealed perm mask   */
+size_t     b  = shm_cap_bounds(cap);  /* sealed payload cap */
+shm_off_t  o  = shm_cap_offset(cap);  /* heap offset        */
+uint16_t   e  = shm_cap_epoch(cap);   /* ABA epoch          */
+```
+
+### C++ API quick-reference
+
+```cpp
+#include "shm_cap.hpp"
+
+// Derive from a typed handle
+shm::cap<MyObj> c = shm::cap<MyObj>::from_ptr(
+    region, handle, uid, caller_perms, SHM_PERM_READ | SHM_PERM_WRITE);
+
+// Read-write deref
+MyObj *p = c.rw(region);           // requires READ | WRITE
+const MyObj *r = c.get(region);    // requires READ (default)
+
+// Narrow and pass to untrusted code
+shm::cap<MyObj> ro = c.narrow(SHM_PERM_READ);
+
+// Boolean validity check
+if (!ro.valid(region)) { /* handle stale/freed */ }
+
+// Unsafe reinterpret (type annotation only, no security impact)
+shm::cap<Base> base = c.reinterpret_as<Base>();
+```
+
+### Comparison to hardware CHERI
+
+| Property              | Hardware CHERI                     | shm_alloc capability            |
+|-----------------------|------------------------------------|---------------------------------|
+| Enforcement           | CPU microcode; unforgeable in HW   | Software checks on every call   |
+| Tag bit storage       | 1 extra bit per memory word (HW)   | `block->allocated` in heap hdr  |
+| Forgeability          | Impossible below the kernel        | Defeated by raw `mmap` write    |
+| Sub-object bounds     | Full 64-bit base + length          | 32-bit `bounds` (≤ 4 GB obj)    |
+| Revocation            | Load-side tag check, zero-cost     | Free clears tag; deref re-reads |
+| ABA protection        | Not needed (HW enforced)           | 16-bit epoch in meta word       |
+| Cross-host identity   | Single-system                      | `ns_inode` + `cgroup_hash`      |
+| Permission narrowing  | Hardware monotonicity              | Software `shm_cap_narrow()`     |
+
+The capability layer provides CHERI-*like* semantics — opaque handles, bounds
+enforcement, monotonic narrowing, and automatic liveness checking — at the
+cost of being bypassable by a process that holds the underlying `mmap` file
+descriptor.  Pairing it with OS-level isolation (IPC namespaces,
+`SHM_OPEN_ENFORCE_NS`, cgroup enforcement) achieves meaningful protection for
+the disaggregated-memory threat model.
+
+---
+
 ## File structure
 
 ```
 include/
   shm_alloc.h      C public API (types, constants, all function declarations)
   shm_alloc.hpp    C++ typed wrappers (shm::ptr<T>, make, cast, find, free)
+  shm_cap.h        C capability API (shm_cap_t, derive, deref, narrow, …)
+  shm_cap.hpp      C++ typed capability wrapper (shm::cap<T>)
 src/
+  shm_internal.h   Internal layout types + inline helpers (shm_block_hdr_t, …)
   shm_alloc.c      Core allocator (region, heap, directory, resize)
+  shm_cap.c        CHERI-like capability layer (derive, deref, validate)
   shm_ns.h         Internal: IPC namespace + cgroup fingerprint declarations
   shm_ns.c         Internal: /proc/self/ns/ipc inode + FNV-1a cgroup hash
 tests/
   test_basic.c     open/close, alloc, lookup, permissions, multi-object
   test_resize.c    shrink, in-place grow, relocation grow, permission check
   test_multihost.c fork-based multi-process discovery, NS enforcement
+  test_cap.c       capability derive, deref, tag bit, ABA, narrowing, forgery
 Makefile
 ```
