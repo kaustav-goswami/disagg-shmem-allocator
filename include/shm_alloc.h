@@ -116,6 +116,8 @@ typedef uint32_t shm_user_id_t;
 typedef enum shm_backend {
     SHM_BACKEND_POSIX = 0,  /* POSIX shm_open IPC shared memory        */
     SHM_BACKEND_DAX   = 1,  /* /dev/daxX.Y disaggregated / CXL memory  */
+    SHM_BACKEND_FILE  = 2,  /* regular file path (open+mmap); no size   */
+                            /* limit from /dev/shm; suitable for /tmp   */
 } shm_backend_t;
 
 /* ── Open flags ──────────────────────────────────────────────────────────── */
@@ -222,6 +224,16 @@ void  *shm_region_base(const shm_region_t *region);
 
 /** Return the total mapping size in bytes. */
 size_t shm_region_size(const shm_region_t *region);
+
+/**
+ * @brief Return a pointer to the first byte of the heap payload area.
+ *
+ * All shm_off_t values are byte offsets from this address.
+ * Useful for implementing external bump-allocators that keep a slab-relative
+ * offset and need to convert between offsets and virtual addresses without
+ * calling shm_ptr() on every access.
+ */
+void *shm_heap_base_ptr(const shm_region_t *region);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Allocation

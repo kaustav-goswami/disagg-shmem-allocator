@@ -728,6 +728,34 @@ int shm_region_open(const char                   *name_or_path,
             }
             size = (size_t)st.st_size;  /* trust the stored size */
         }
+    } else if (backend == SHM_BACKEND_FILE) {
+        /* Regular file path — works with any filesystem (e.g. /tmp).
+         * Unlike POSIX shm, there is no /dev/shm size limit.
+         * Uses ftruncate to set size on creation; fstat to read it on attach. */
+        int oflags = creating ? (O_CREAT | O_RDWR | O_TRUNC) : O_RDWR;
+        reg->fd = open(name_or_path, oflags, mode ? mode : 0660);
+        if (reg->fd < 0) {
+            int err = errno;
+            free(reg->name); free(reg);
+            return err;
+        }
+        if (creating && size >= 4096) {
+            if (ftruncate(reg->fd, (off_t)size) != 0) {
+                int err = errno;
+                close(reg->fd); unlink(name_or_path);
+                free(reg->name); free(reg);
+                return err;
+            }
+        }
+        if (!creating) {
+            struct stat st;
+            if (fstat(reg->fd, &st) != 0) {
+                int err = errno;
+                close(reg->fd); free(reg->name); free(reg);
+                return err;
+            }
+            size = (size_t)st.st_size;
+        }
     } else {
         /* DAX / disaggregated memory: open the device file directly. */
         reg->fd = open(name_or_path, O_RDWR);
@@ -837,9 +865,13 @@ void shm_region_close(shm_region_t *region, bool unlink_name)
     if (region->fd >= 0)
         close(region->fd);   /* release file descriptor */
 
-    /* Only POSIX shm objects can be unlinked; DAX device nodes cannot. */
-    if (unlink_name && region->name && region->backend == SHM_BACKEND_POSIX)
-        shm_unlink(region->name);  /* remove the /dev/shm entry */
+    if (unlink_name && region->name) {
+        if (region->backend == SHM_BACKEND_POSIX)
+            shm_unlink(region->name);     /* remove the /dev/shm entry */
+        else if (region->backend == SHM_BACKEND_FILE)
+            unlink(region->name);         /* remove the regular file */
+        /* DAX device nodes cannot be unlinked; silently ignored. */
+    }
 
     free(region->name);  /* release name copy */
     free(region);        /* release handle struct */
@@ -853,6 +885,11 @@ void *shm_region_base(const shm_region_t *region)
 size_t shm_region_size(const shm_region_t *region)
 {
     return region ? region->size : 0;
+}
+
+void *shm_heap_base_ptr(const shm_region_t *region)
+{
+    return region ? heap_base(region) : NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
