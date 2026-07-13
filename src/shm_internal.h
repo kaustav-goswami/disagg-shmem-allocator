@@ -83,6 +83,7 @@ typedef struct shm_region_hdr {
     uint64_t        next_id;        /* next monotonic object ID (starts at 1) */
     uint64_t        ns_inode;       /* IPC namespace inode of creator         */
     uint64_t        cgroup_hash;    /* FNV-1a hash of /proc/self/cgroup       */
+    uint64_t        map_base;       /* creator's mmap VA; attach remaps here  */
     char            shm_name[64];   /* the name/path used at creation         */
 } shm_region_hdr_t;
 
