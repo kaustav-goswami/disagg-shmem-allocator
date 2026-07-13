@@ -18,7 +18,7 @@
  *  A single process-shared robust pthread_mutex_t serialises all mutations.
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "shm_internal.h"   /* shared structs, inline helpers */
 #include "shm_ns.h"         /* namespace / cgroup fingerprinting */
@@ -35,6 +35,21 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef MAP_FIXED_NOREPLACE
+/* Linux 4.17+; hard-code the value so older headers still compile. */
+#  define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+/*
+ * Default preferred virtual address for the shared mapping.
+ * Memcached embeds raw C pointers in the slab arena, so every attaching
+ * process (and every CXL host) must map the region at the same VA.
+ * Override with the SHM_MAP_BASE environment variable (hex or decimal).
+ */
+#ifndef SHM_DEFAULT_MAP_ADDR
+#  define SHM_DEFAULT_MAP_ADDR ((uintptr_t)0x40000000000ULL)  /* 4 TiB */
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Permission checking
@@ -363,6 +378,7 @@ static void region_init(shm_region_t *r, size_t total_size,
     rh->host_count   = 0;           /* incremented by shm_region_open after init */
     rh->ns_inode     = shm_ns_ipc_inode();    /* creator's IPC namespace inode */
     rh->cgroup_hash  = shm_ns_cgroup_hash();  /* creator's cgroup fingerprint */
+    rh->map_base     = (uint64_t)(uintptr_t)r->base;  /* fixed-VA for attach */
     if (name)
         strncpy(rh->shm_name, name, sizeof(rh->shm_name) - 1);
 
@@ -414,6 +430,79 @@ static int region_lock(shm_region_t *r)
 static void region_unlock(shm_region_t *r)
 {
     pthread_mutex_unlock(&shm_rh(r)->mutex);
+}
+
+/*
+ * Read the capacity of a Linux device-DAX node from sysfs.
+ *
+ * /dev/daxX.Y is a character device: fstat(2).st_size is not the memory
+ * capacity (often 0).  The size in bytes is published as a decimal string at:
+ *   /sys/bus/dax/devices/daxX.Y/size   (current kernel)
+ *   /sys/class/dax/daxX.Y/size         (legacy compat driver)
+ *
+ * Returns 0 if the size cannot be determined.
+ */
+static size_t dax_device_size_bytes(const char *dev_path)
+{
+    const char *base = strrchr(dev_path, '/');
+    base = base ? base + 1 : dev_path;
+    if (base[0] == '\0')
+        return 0;
+
+    static const char *const patterns[] = {
+        "/sys/bus/dax/devices/%s/size",
+        "/sys/class/dax/%s/size",
+        NULL
+    };
+
+    for (int i = 0; patterns[i] != NULL; i++) {
+        char sysfs_path[256];
+        if (snprintf(sysfs_path, sizeof(sysfs_path), patterns[i], base)
+                >= (int)sizeof(sysfs_path))
+            continue;
+
+        FILE *fp = fopen(sysfs_path, "r");
+        if (!fp)
+            continue;
+
+        unsigned long long val = 0;
+        int n = fscanf(fp, "%llu", &val);
+        fclose(fp);
+
+        if (n == 1 && val >= 4096)
+            return (size_t)val;
+    }
+
+    return 0;
+}
+
+/** Preferred map address: SHM_MAP_BASE env, else SHM_DEFAULT_MAP_ADDR. */
+static void *shm_preferred_map_addr(void)
+{
+    const char *env = getenv("SHM_MAP_BASE");
+    if (env && env[0] != '\0') {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 0);
+        if (end != env && v != 0)
+            return (void *)(uintptr_t)v;
+    }
+    return (void *)SHM_DEFAULT_MAP_ADDR;
+}
+
+/**
+ * Map @p size bytes of @p fd into the process.
+ * Prefer @p hint with MAP_FIXED_NOREPLACE; fall back to any address if the
+ * hint is unavailable (create path only — attach requires an exact match).
+ */
+static void *shm_mmap_region(int fd, size_t size, void *hint, bool require_hint)
+{
+    void *p = mmap(hint, size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+    if (p != MAP_FAILED)
+        return p;
+    if (require_hint)
+        return MAP_FAILED;
+    return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -473,7 +562,7 @@ int shm_region_open(const char                   *name_or_path,
             size = (size_t)st.st_size;
         }
     } else {
-        /* DAX backend: open the device file directly. */
+        /* DAX / disaggregated memory: open the device file directly. */
         reg->fd = open(name_or_path, O_RDWR);
         if (reg->fd < 0) {
             int err = errno;
@@ -481,11 +570,22 @@ int shm_region_open(const char                   *name_or_path,
             return err;
         }
         if (size < 4096) {
-            struct stat st;
-            if (fstat(reg->fd, &st) == 0 && st.st_size > 0)
-                size = (size_t)st.st_size;
-            else
-                size = 2u << 20;
+            /* Character device: read capacity from sysfs, not fstat. */
+            size = dax_device_size_bytes(name_or_path);
+            if (size < 4096) {
+                struct stat st;
+                if (fstat(reg->fd, &st) == 0 && (size_t)st.st_size >= 4096)
+                    size = (size_t)st.st_size;
+            }
+            if (size < 4096) {
+                fprintf(stderr,
+                        "shm_alloc: cannot determine size of DAX device '%s' "
+                        "(try: cat /sys/bus/dax/devices/<name>/size)\n",
+                        name_or_path);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return ENODEV;
+            }
         }
     }
 
@@ -496,26 +596,75 @@ int shm_region_open(const char                   *name_or_path,
         return EINVAL;
     }
 
-    reg->base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, reg->fd, 0);
-    if (reg->base == MAP_FAILED) {
-        int err = errno;
-        close(reg->fd);
-        if (backend == SHM_BACKEND_POSIX && creating) shm_unlink(name_or_path);
-        free(reg->name); free(reg);
-        return err;
-    }
-    reg->size = size;
-
-    shm_region_hdr_t *rh = shm_rh(reg);
-
     if (creating) {
+        /*
+         * Map at a stable preferred VA so attaching processes (and CXL hosts)
+         * can remap with MAP_FIXED_NOREPLACE and keep raw pointers valid.
+         */
+        reg->base = shm_mmap_region(reg->fd, size, shm_preferred_map_addr(),
+                                    /*require_hint=*/false);
+        if (reg->base == MAP_FAILED) {
+            int err = errno;
+            close(reg->fd);
+            if (backend == SHM_BACKEND_POSIX) shm_unlink(name_or_path);
+            free(reg->name); free(reg);
+            return err;
+        }
+        reg->size = size;
         region_init(reg, size, backend, dir_cap, name_or_path);
     } else {
-        if (rh->magic != SHM_ALLOC_MAGIC_REGION || rh->version != SHM_ALLOC_VERSION) {
-            munmap(reg->base, reg->size);
+        /*
+         * Attach: provisional map to read map_base, then remap exactly there
+         * so item and slab pointers stored by the creator remain valid.
+         */
+        void *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         reg->fd, 0);
+        if (tmp == MAP_FAILED) {
+            int err = errno;
+            close(reg->fd); free(reg->name); free(reg);
+            return err;
+        }
+        shm_region_hdr_t *rh = (shm_region_hdr_t *)tmp;
+        if (rh->magic != SHM_ALLOC_MAGIC_REGION ||
+            rh->version != SHM_ALLOC_VERSION) {
+            munmap(tmp, size);
             close(reg->fd); free(reg->name); free(reg);
             return ENOENT;
         }
+        void *want = (void *)(uintptr_t)rh->map_base;
+        size_t region_size = rh->region_size;
+        if (region_size >= 4096 && region_size <= size)
+            size = region_size;
+
+        if (want == NULL || want == tmp) {
+            reg->base = tmp;
+        } else {
+            munmap(tmp, size);
+            reg->base = shm_mmap_region(reg->fd, size, want,
+                                        /*require_hint=*/true);
+            if (reg->base == MAP_FAILED) {
+                /*
+                 * Hint unavailable (e.g. same process already holds the VA).
+                 * Fall back to any address — offset-based clients still work;
+                 * raw-pointer clients (memcached) must detect the mismatch.
+                 */
+                fprintf(stderr,
+                        "shm_alloc: warning: cannot map '%s' at creator VA %p "
+                        "(%s); falling back to a different address. "
+                        "Raw pointers in the region will be invalid.\n",
+                        name_or_path, want, strerror(errno));
+                reg->base = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, reg->fd, 0);
+                if (reg->base == MAP_FAILED) {
+                    int err = errno;
+                    close(reg->fd); free(reg->name); free(reg);
+                    return err;
+                }
+            }
+        }
+        reg->size = size;
+        rh = shm_rh(reg);
+
         if ((flags & SHM_OPEN_ENFORCE_NS) && rh->ns_inode != 0) {
             uint64_t my_ns = shm_ns_ipc_inode();
             if (my_ns != 0 && my_ns != rh->ns_inode) {

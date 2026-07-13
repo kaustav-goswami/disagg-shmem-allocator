@@ -75,7 +75,7 @@ extern "C" {
 /** Stored at the start of every heap block header. */
 #define SHM_ALLOC_MAGIC_BLOCK   0x424C4B21u  /* "BLK!" in ASCII */
 /** Incremented every time the on-disk layout changes in a breaking way. */
-#define SHM_ALLOC_VERSION       2u
+#define SHM_ALLOC_VERSION       3u
 
 /* ── Heap-relative payload offset ───────────────────────────────────────── */
 
