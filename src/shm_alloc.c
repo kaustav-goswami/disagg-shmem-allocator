@@ -736,22 +736,35 @@ int shm_region_open(const char                   *name_or_path,
             free(reg->name); free(reg);
             return err;
         }
-        if (size < 4096) {
-            /* Character device: read capacity from sysfs, not fstat. */
-            size = dax_device_size_bytes(name_or_path);
-            if (size < 4096) {
+        {
+            /* Character device: capacity comes from sysfs, not fstat. */
+            size_t dev_size = dax_device_size_bytes(name_or_path);
+            if (dev_size < 4096) {
                 struct stat st;
                 if (fstat(reg->fd, &st) == 0 && (size_t)st.st_size >= 4096)
-                    size = (size_t)st.st_size;
+                    dev_size = (size_t)st.st_size;
             }
             if (size < 4096) {
+                /* size=0 / unspecified → map the entire device. */
+                if (dev_size < 4096) {
+                    fprintf(stderr,
+                            "shm_alloc: cannot determine size of DAX device '%s' "
+                            "(try: cat /sys/bus/dax/devices/<name>/size)\n",
+                            name_or_path);
+                    close(reg->fd);
+                    free(reg->name); free(reg);
+                    return ENODEV;
+                }
+                size = dev_size;
+            } else if (dev_size >= 4096 && size > dev_size) {
+                /* Caller asked for more than the device holds. */
                 fprintf(stderr,
-                        "shm_alloc: cannot determine size of DAX device '%s' "
-                        "(try: cat /sys/bus/dax/devices/<name>/size)\n",
-                        name_or_path);
+                        "shm_alloc: requested mapping %zu bytes exceeds DAX "
+                        "device '%s' capacity %zu bytes\n",
+                        size, name_or_path, dev_size);
                 close(reg->fd);
                 free(reg->name); free(reg);
-                return ENODEV;
+                return ENOSPC;
             }
         }
     }
@@ -788,6 +801,30 @@ int shm_region_open(const char                   *name_or_path,
             close(reg->fd);
             free(reg->name); free(reg);
             return ENOENT;  /* not a valid shm_alloc region */
+        }
+        /*
+         * DAX attach often opens with size=0 (map whole device), but the
+         * creator may have intentionally mapped a smaller window stored in
+         * rh->region_size.  Remap to that window so heap accounting and
+         * gem5 address bounds match the creator.
+         */
+        if (backend == SHM_BACKEND_DAX
+                && rh->region_size >= 4096
+                && rh->region_size != reg->size) {
+            void * rebound = mmap(NULL, rh->region_size,
+                                  PROT_READ | PROT_WRITE, MAP_SHARED,
+                                  reg->fd, 0);
+            if (rebound == MAP_FAILED) {
+                int err = errno;
+                munmap(reg->base, reg->size);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return err;
+            }
+            munmap(reg->base, reg->size);
+            reg->base = rebound;
+            reg->size = rh->region_size;
+            rh = region_hdr(reg);
         }
         /* Optionally enforce IPC namespace match. */
         if ((flags & SHM_OPEN_ENFORCE_NS) && rh->ns_inode != 0) {

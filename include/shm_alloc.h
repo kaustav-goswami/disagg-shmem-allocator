@@ -193,8 +193,11 @@ typedef struct shm_pool_stats {
  *
  * @param name_or_path  Name for POSIX or device path for DAX.
  * @param size          Desired mapping size (bytes, must be ≥ 4096).
- *                      Ignored for non-creating opens (size is read from header).
- *                      Ignored for DAX (device size is used).
+ *                      Ignored for non-creating opens (size is read from the
+ *                      existing object / region header).
+ *                      For DAX create: pass the intended window size (≤ device);
+ *                      pass 0 to map the entire device.  An explicit size larger
+ *                      than the device returns ENOSPC.
  * @param opts          Options; pass NULL for all defaults.
  * @param out_region    Receives the newly allocated handle on success.
  * @return              0 on success, errno-compatible code on failure.
