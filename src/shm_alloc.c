@@ -737,29 +737,34 @@ static size_t vma_length_containing(const void *addr)
  * If a DAX mmap overshot @p want_size (gem5 or kernel quirk mapping the
  * whole device), chop the excess with munmap so offsets past shm_size
  * become unmapped and cannot produce gem5 packets past the window.
+ *
+ * Only act when /proc/self/maps shows a VMA larger than want_size.
+ * munmap() of an already-unmapped range returns 0 on Linux, so probing
+ * with (dev_size - want_size) produces a false "chopped" message.
  */
 static void chop_dax_overmap(void *base, size_t want_size, size_t dev_size)
 {
+    (void)dev_size;
     if (!base || want_size < 4096)
         return;
 
     size_t vma_len = vma_length_containing(base);
-    size_t excess = 0;
-
-    if (vma_len > want_size)
-        excess = vma_len - want_size;
-    else if (dev_size > want_size)
-        excess = dev_size - want_size; /* try anyway; munmap fails if absent */
-
-    if (excess == 0)
+    if (vma_len == 0 || vma_len <= want_size)
         return;
 
-    if (munmap((char *)base + want_size, excess) == 0) {
+    size_t excess = vma_len - want_size;
+    if (munmap((char *)base + want_size, excess) != 0) {
         fprintf(stderr,
-                "shm_alloc: chopped %zu bytes past window (vma was %zu, "
-                "want %zu) — OOB past shm_size will now SIGSEGV\n",
-                excess, vma_len ? vma_len : want_size + excess, want_size);
+                "shm_alloc: WARNING failed to chop %zu-byte over-map "
+                "(vma=%zu want=%zu): %s\n",
+                excess, vma_len, want_size, strerror(errno));
+        return;
     }
+
+    fprintf(stderr,
+            "shm_alloc: chopped %zu bytes past window (vma was %zu, "
+            "want %zu) — OOB past shm_size will now SIGSEGV\n",
+            excess, vma_len, want_size);
 
     vma_len = vma_length_containing(base);
     if (vma_len != 0 && vma_len != want_size) {
@@ -771,10 +776,14 @@ static void chop_dax_overmap(void *base, size_t want_size, size_t dev_size)
 }
 
 /**
- * Install PROT_NONE guard pages:
- *   1) last @p guard_bytes of the DAX/POSIX mapping (in-region)
- *   2) anonymous PROT_NONE immediately after the mapping (post-VMA)
- * Re-applied on every attach (mprotect is per-process).
+ * Install PROT_NONE guard pages at the end of the mapped window (and
+ * optionally immediately after it).
+ *
+ * Device DAX mappings reject mprotect() (EINVAL).  For DAX we munmap the
+ * trailing guard zone and replace it with anonymous PROT_NONE so OOB walks
+ * still SIGSEGV.  POSIX uses mprotect in-place.
+ *
+ * Re-applied on every attach (protections are per-process).
  */
 static int install_guard_pages(shm_region_t *reg, uint32_t guard_pages)
 {
@@ -790,11 +799,41 @@ static int install_guard_pages(shm_region_t *reg, uint32_t guard_pages)
         return EINVAL;
 
     void *in_guard = (char *)reg->base + reg->size - guard_bytes;
-    if (mprotect(in_guard, guard_bytes, PROT_NONE) != 0) {
-        int err = errno;
-        fprintf(stderr, "shm_alloc: mprotect in-region guard failed: %s\n",
-                strerror(err));
-        return err;
+    bool in_ok = false;
+
+    if (reg->backend == SHM_BACKEND_DAX) {
+        /*
+         * /dev/dax does not support mprotect.  Unmap the tail of the DAX
+         * VMA and put anonymous PROT_NONE pages in that VA range so the
+         * addresses stay reserved and fault on access.
+         */
+        if (munmap(in_guard, guard_bytes) != 0) {
+            fprintf(stderr,
+                    "shm_alloc: WARNING DAX guard munmap failed (%s); "
+                    "falling back to post-VMA guards only\n",
+                    strerror(errno));
+        } else {
+            void *p = mmap(in_guard, guard_bytes, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (p == MAP_FAILED) {
+                fprintf(stderr,
+                        "shm_alloc: WARNING DAX in-region anonymous guard "
+                        "failed (%s); VA hole still faults on access\n",
+                        strerror(errno));
+                /* Unmapped hole still SIGSEGVs — treat as success. */
+                in_ok = true;
+            } else {
+                in_ok = true;
+            }
+        }
+    } else {
+        if (mprotect(in_guard, guard_bytes, PROT_NONE) != 0) {
+            fprintf(stderr,
+                    "shm_alloc: WARNING mprotect in-region guard failed: %s\n",
+                    strerror(errno));
+        } else {
+            in_ok = true;
+        }
     }
 
     void *post = mmap((char *)reg->base + reg->size, guard_bytes,
@@ -802,18 +841,22 @@ static int install_guard_pages(shm_region_t *reg, uint32_t guard_pages)
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
                       -1, 0);
     if (post == MAP_FAILED) {
-        /* Non-fatal: in-region guard still catches walks within the window. */
         fprintf(stderr,
-                "shm_alloc: WARNING post-VMA guard mmap failed (%s); "
-                "in-region guard (%zu pages) is still active at %p\n",
-                strerror(errno), (size_t)guard_pages, in_guard);
+                "shm_alloc: WARNING post-VMA guard mmap failed (%s)\n",
+                strerror(errno));
     } else {
         reg->post_guard_bytes = guard_bytes;
     }
 
+    if (!in_ok && reg->post_guard_bytes == 0) {
+        fprintf(stderr, "shm_alloc: no guard pages could be installed\n");
+        return EFAULT;
+    }
+
     fprintf(stderr,
-            "shm_alloc: guards active — in-region PROT_NONE %zu bytes at %p "
+            "shm_alloc: guards active — in-region %s %zu bytes at %p "
             "(offsets %zu..%zu)%s\n",
+            reg->backend == SHM_BACKEND_DAX ? "unmapped/anon" : "PROT_NONE",
             guard_bytes, in_guard,
             reg->size - guard_bytes, reg->size,
             reg->post_guard_bytes
