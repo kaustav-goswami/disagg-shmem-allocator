@@ -25,7 +25,7 @@
  *  torn reads; shm_dir_next does not lock (best-effort snapshot).
  */
 
-#define _POSIX_C_SOURCE 200809L   /* POSIX 2008: shm_open, robust mutexes, strdup */
+#define _GNU_SOURCE      /* MAP_FIXED_NOREPLACE, shm_open, strdup */
 
 #include "shm_alloc.h"   /* public API */
 #include "shm_ns.h"      /* namespace + cgroup fingerprinting */
@@ -36,7 +36,7 @@
 #include <stdbool.h>     /* bool, true, false */
 #include <stddef.h>      /* size_t, NULL */
 #include <stdint.h>      /* uint8_t, uint32_t, uint64_t */
-#include <stdio.h>       /* snprintf */
+#include <stdio.h>       /* snprintf, fprintf */
 #include <stdlib.h>      /* malloc, free, calloc */
 #include <string.h>      /* memset, memcpy, strncpy, strcmp */
 #include <sys/mman.h>    /* mmap, munmap, MAP_SHARED, PROT_READ, PROT_WRITE */
@@ -45,6 +45,20 @@
 
 /* POSIX shared-memory API lives in <sys/mman.h> on Linux but needs -lrt. */
 #include <sys/mman.h>    /* shm_open, shm_unlink (linked via -lrt) */
+
+/* Older glibc/headers may lack the flag; the numeric value is stable on Linux. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+/*
+ * Preferred mmap VA for new regions.  Using a stable high address makes
+ * cross-process MAP_FIXED attach reliable under ASLR (critical for memcached
+ * raw pointers).  Falls back to mmap(NULL) if the hint is unavailable.
+ */
+#ifndef SHM_PREFERRED_MAP_BASE
+#define SHM_PREFERRED_MAP_BASE ((uintptr_t)0x4000000000ULL)
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Internal constants
@@ -105,6 +119,7 @@ typedef struct shm_region_hdr {
     uint64_t        next_id;        /* next monotonic object ID to assign */
     uint64_t        ns_inode;       /* IPC namespace inode of region creator */
     uint64_t        cgroup_hash;    /* FNV-1a hash of creator's /proc/self/cgroup */
+    uint64_t        map_base_addr;  /* creator mmap VA; attachers must match */
     char            shm_name[64];   /* the name/path supplied to shm_region_open */
 } shm_region_hdr_t;
 
@@ -558,6 +573,9 @@ static void region_init(shm_region_t *r, size_t total_size,
     rh->host_count   = 0;   /* incremented by shm_region_open after init */
     rh->ns_inode     = shm_ns_ipc_inode();    /* record creator's IPC namespace */
     rh->cgroup_hash  = shm_ns_cgroup_hash();  /* record creator's cgroup path hash */
+    /* Raw pointers embedded in the region are only valid if every process
+     * maps at this same virtual address (see attach path below). */
+    rh->map_base_addr = (uint64_t)(uintptr_t)r->base;
 
     /* Copy the name / path for debugging and re-identification. */
     if (name)
@@ -769,83 +787,141 @@ int shm_region_open(const char                   *name_or_path,
         }
     }
 
-    if (size < 4096) {
+    if (creating && size < 4096) {
         /* Guard: region must be at least one page so the header fits. */
         close(reg->fd);
-        if (backend == SHM_BACKEND_POSIX && creating) shm_unlink(name_or_path);
+        if (backend == SHM_BACKEND_POSIX) shm_unlink(name_or_path);
         free(reg->name); free(reg);
         return EINVAL;
     }
 
-    /* ── Map the backing store into this process's address space. ── */
-    reg->base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, reg->fd, 0);
-    if (reg->base == MAP_FAILED) {
-        int err = errno;
-        close(reg->fd);
-        if (backend == SHM_BACKEND_POSIX && creating) shm_unlink(name_or_path);
-        free(reg->name); free(reg);
-        return err;
-    }
-    reg->size = size;
-
-    /* ── Initialise or validate the region header. ── */
-    shm_region_hdr_t *rh = region_hdr(reg);
-
     if (creating) {
-        /* Creator: initialise the header, directory, and initial free block. */
+        /* ── Creator: map exactly `size` bytes, prefer a stable VA. ── */
+        void *base = mmap((void *)SHM_PREFERRED_MAP_BASE, size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_FIXED_NOREPLACE, reg->fd, 0);
+        if (base == MAP_FAILED) {
+            base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        reg->fd, 0);
+        }
+        if (base == MAP_FAILED) {
+            int err = errno;
+            close(reg->fd);
+            if (backend == SHM_BACKEND_POSIX) shm_unlink(name_or_path);
+            free(reg->name); free(reg);
+            return err;
+        }
+        reg->base = base;
+        reg->size = size;
         region_init(reg, size, backend, dir_cap, name_or_path);
+        fprintf(stderr,
+                "shm_alloc: created %s region size=%zu VA=%p map_base_addr=%p\n",
+                backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
+                size, reg->base, (void *)(uintptr_t)region_hdr(reg)->map_base_addr);
     } else {
-        /* Non-creator: verify that what we mapped is a valid region. */
-        if (rh->magic != SHM_ALLOC_MAGIC_REGION || rh->version != SHM_ALLOC_VERSION) {
-            munmap(reg->base, reg->size);
+        /*
+         * Attacher: never map the whole DAX device.  Peek one page to read
+         * region_size + map_base_addr, then map exactly that window at the
+         * creator's VA so raw pointers embedded in the region stay valid and
+         * DAX-relative offsets cannot exceed the gem5/shm_size window.
+         */
+        const size_t peek_sz = 4096;
+        void *peek = mmap(NULL, peek_sz, PROT_READ | PROT_WRITE, MAP_SHARED,
+                          reg->fd, 0);
+        if (peek == MAP_FAILED) {
+            int err = errno;
             close(reg->fd);
             free(reg->name); free(reg);
-            return ENOENT;  /* not a valid shm_alloc region */
+            return err;
         }
+
+        const shm_region_hdr_t *ph = (const shm_region_hdr_t *)peek;
+        if (ph->magic != SHM_ALLOC_MAGIC_REGION || ph->version != SHM_ALLOC_VERSION) {
+            munmap(peek, peek_sz);
+            close(reg->fd);
+            free(reg->name); free(reg);
+            return ENOENT;
+        }
+
+        size_t    win      = ph->region_size;
+        uintptr_t want_va  = (uintptr_t)ph->map_base_addr;
+        uint64_t  ns_inode = ph->ns_inode;
+        uint64_t  cg_hash  = ph->cgroup_hash;
+        munmap(peek, peek_sz);
+
+        if (win < 4096 || want_va == 0) {
+            fprintf(stderr,
+                    "shm_alloc: attach refused — region_size=%zu map_base_addr=%p "
+                    "(re-create the region with a current shm_alloc)\n",
+                    win, (void *)want_va);
+            close(reg->fd);
+            free(reg->name); free(reg);
+            return EINVAL;
+        }
+
+        /* Optional namespace / cgroup checks use values captured from the peek. */
+        if ((flags & SHM_OPEN_ENFORCE_NS) && ns_inode != 0) {
+            uint64_t my_ns = shm_ns_ipc_inode();
+            if (my_ns != 0 && my_ns != ns_inode) {
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return EPERM;
+            }
+        }
+        if ((flags & SHM_OPEN_ENFORCE_CGROUP) && cg_hash != 0) {
+            uint64_t my_cg = shm_ns_cgroup_hash();
+            if (my_cg != 0 && my_cg != cg_hash) {
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return EPERM;
+            }
+        }
+
         /*
-         * DAX attach often opens with size=0 (map whole device), but the
-         * creator may have intentionally mapped a smaller window stored in
-         * rh->region_size.  Remap to that window so heap accounting and
-         * gem5 address bounds match the creator.
+         * Prefer the creator's VA so raw pointers embedded in the region
+         * remain valid (memcached).  Offset-based clients still work if the
+         * fixed map fails (e.g. same-process re-open in tests, or the VA is
+         * already occupied) — callers that need raw pointers must check.
          */
-        if (backend == SHM_BACKEND_DAX
-                && rh->region_size >= 4096
-                && rh->region_size != reg->size) {
-            void * rebound = mmap(NULL, rh->region_size,
-                                  PROT_READ | PROT_WRITE, MAP_SHARED,
-                                  reg->fd, 0);
-            if (rebound == MAP_FAILED) {
+        void *base = mmap((void *)want_va, win,
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_FIXED_NOREPLACE,
+                          reg->fd, 0);
+        bool fixed = (base != MAP_FAILED);
+        if (!fixed) {
+            base = mmap(NULL, win, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        reg->fd, 0);
+            if (base == MAP_FAILED) {
                 int err = errno;
-                munmap(reg->base, reg->size);
                 close(reg->fd);
                 free(reg->name); free(reg);
                 return err;
             }
+            if ((uintptr_t)base != want_va) {
+                fprintf(stderr,
+                        "shm_alloc: WARNING attach VA %p != creator %p "
+                        "(size=%zu) — offset API ok; raw shared pointers "
+                        "are NOT valid in this process\n",
+                        base, (void *)want_va, win);
+            }
+        }
+
+        reg->base = base;
+        reg->size = win;
+
+        shm_region_hdr_t *rh = region_hdr(reg);
+        if (rh->magic != SHM_ALLOC_MAGIC_REGION || rh->version != SHM_ALLOC_VERSION
+                || rh->region_size != win) {
             munmap(reg->base, reg->size);
-            reg->base = rebound;
-            reg->size = rh->region_size;
-            rh = region_hdr(reg);
+            close(reg->fd);
+            free(reg->name); free(reg);
+            return ENOENT;
         }
-        /* Optionally enforce IPC namespace match. */
-        if ((flags & SHM_OPEN_ENFORCE_NS) && rh->ns_inode != 0) {
-            uint64_t my_ns = shm_ns_ipc_inode();
-            if (my_ns != 0 && my_ns != rh->ns_inode) {
-                munmap(reg->base, reg->size);
-                close(reg->fd);
-                free(reg->name); free(reg);
-                return EPERM;  /* different IPC namespace */
-            }
-        }
-        /* Optionally enforce cgroup match. */
-        if ((flags & SHM_OPEN_ENFORCE_CGROUP) && rh->cgroup_hash != 0) {
-            uint64_t my_cg = shm_ns_cgroup_hash();
-            if (my_cg != 0 && my_cg != rh->cgroup_hash) {
-                munmap(reg->base, reg->size);
-                close(reg->fd);
-                free(reg->name); free(reg);
-                return EPERM;  /* different cgroup */
-            }
-        }
+
+        fprintf(stderr,
+                "shm_alloc: attached %s region size=%zu VA=%p (%s)\n",
+                backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
+                win, reg->base, fixed ? "fixed" : "relocated");
     }
 
     /* ── Increment the attached host counter atomically under the mutex. ── */

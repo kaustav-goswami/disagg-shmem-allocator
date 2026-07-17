@@ -50,10 +50,10 @@
  *
  * ── Pointer safety ────────────────────────────────────────────────────────────
  *
- *   All cross-process handles are shm_off_t heap-relative byte offsets.
- *   shm_ptr() converts an offset to a local virtual address after checking
- *   magic, ownership, and permissions.  Never store raw pointers in shared
- *   memory — the mapping base differs between processes.
+ *   Library handles are shm_off_t heap-relative byte offsets; shm_ptr()
+ *   converts them to a local VA.  Callers that embed raw C pointers inside
+ *   the region (e.g. memcached item lists) MUST map at the creator's VA:
+ *   the region header stores map_base_addr and attach uses MAP_FIXED_NOREPLACE.
  */
 
 #ifndef SHM_ALLOC_H
@@ -75,7 +75,7 @@ extern "C" {
 /** Stored at the start of every heap block header. */
 #define SHM_ALLOC_MAGIC_BLOCK   0x424C4B21u  /* "BLK!" in ASCII */
 /** Incremented every time the on-disk layout changes in a breaking way. */
-#define SHM_ALLOC_VERSION       2u
+#define SHM_ALLOC_VERSION       3u
 
 /* ── Heap-relative payload offset ───────────────────────────────────────── */
 
