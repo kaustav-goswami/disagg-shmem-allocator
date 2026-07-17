@@ -120,6 +120,8 @@ typedef struct shm_region_hdr {
     uint64_t        ns_inode;       /* IPC namespace inode of region creator */
     uint64_t        cgroup_hash;    /* FNV-1a hash of creator's /proc/self/cgroup */
     uint64_t        map_base_addr;  /* creator mmap VA; attachers must match */
+    uint32_t        guard_pages;    /* PROT_NONE pages at end of mapped window */
+    uint32_t        _pad1;
     char            shm_name[64];   /* the name/path supplied to shm_region_open */
 } shm_region_hdr_t;
 
@@ -147,7 +149,10 @@ struct shm_region {
     char          *name;      /* heap copy of the name or device path */
     int            fd;        /* file descriptor from shm_open / open */
     void          *base;      /* mmap base pointer */
-    size_t         size;      /* total mapping length */
+    size_t         size;      /* usable+guard mapping length (DAX window) */
+    size_t         guard_bytes; /* PROT_NONE bytes at end of mapping + after */
+    size_t         post_guard_bytes; /* anonymous PROT_NONE after the VMA */
+    size_t         dev_size;  /* DAX device capacity (0 for POSIX) */
     bool           creator;   /* true if this process initialised the region */
     shm_backend_t  backend;   /* which backend was used */
 };
@@ -174,10 +179,14 @@ static char *heap_base(const shm_region_t *r)
     return (char *)r->base + region_hdr(r)->data_offset;
 }
 
-/** Total bytes in the heap (region_size minus the two fixed-size headers). */
+/** Total usable heap bytes (excludes in-region PROT_NONE guard pages). */
 static size_t heap_size(const shm_region_t *r)
 {
-    return r->size - region_hdr(r)->data_offset;
+    size_t total = r->size - region_hdr(r)->data_offset;
+    size_t guard = (size_t)region_hdr(r)->guard_pages * (size_t)sysconf(_SC_PAGESIZE);
+    if (guard > total)
+        return 0;
+    return total - guard;
 }
 
 /** Convert a heap-header-offset (hoff) to a block pointer. */
@@ -540,11 +549,17 @@ static uint32_t dir_count_live(const shm_region_t *r)
 /**
  * Compute the region layout (dir_offset, data_offset) and initialise the
  * header + directory + initial free block.  Called only by the creating process.
+ *
+ * @param guard_pages  PROT_NONE pages reserved at the end of the mapping;
+ *                     excluded from the initial free-list heap.
  */
 static void region_init(shm_region_t *r, size_t total_size,
                         shm_backend_t backend, uint32_t dir_cap,
-                        const char *name)
+                        const char *name, uint32_t guard_pages)
 {
+    size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
+    size_t guard_bytes = (size_t)guard_pages * page_sz;
+
     /* Step 1: compute offsets.
      * The region header is at offset 0; round its size up to HEAP_ALIGN. */
     size_t hdr_sz  = align_up(sizeof(shm_region_hdr_t), HEAP_ALIGN);
@@ -555,8 +570,14 @@ static void region_init(shm_region_t *r, size_t total_size,
     /* The heap starts right after the directory. */
     size_t data_off = dir_off + dir_sz;
 
-    /* Step 2: zero the entire mapping to start with a clean slate. */
-    memset(r->base, 0, total_size);
+    if (total_size <= data_off + guard_bytes + BLOCK_MIN) {
+        /* Caller must have validated size; keep going with empty heap. */
+        guard_bytes = 0;
+        guard_pages = 0;
+    }
+
+    /* Step 2: zero the usable part of the mapping (skip PROT_NONE guard). */
+    memset(r->base, 0, total_size - guard_bytes);
 
     /* Step 3: fill in the region header. */
     shm_region_hdr_t *rh = region_hdr(r);
@@ -576,6 +597,7 @@ static void region_init(shm_region_t *r, size_t total_size,
     /* Raw pointers embedded in the region are only valid if every process
      * maps at this same virtual address (see attach path below). */
     rh->map_base_addr = (uint64_t)(uintptr_t)r->base;
+    rh->guard_pages   = guard_pages;
 
     /* Copy the name / path for debugging and re-identification. */
     if (name)
@@ -593,8 +615,9 @@ static void region_init(shm_region_t *r, size_t total_size,
     pthread_mutex_init(&rh->mutex, &attr);
     pthread_mutexattr_destroy(&attr);
 
-    /* Step 5: create the initial single free block covering the entire heap. */
-    size_t heap_sz = total_size - data_off;      /* available heap bytes */
+    /* Step 5: create the initial single free block covering the usable heap
+     * (everything except the trailing PROT_NONE guard pages). */
+    size_t heap_sz = total_size - data_off - guard_bytes;
     shm_block_hdr_t *initial = blk_at_hoff(r, 0);  /* first block at hoff=0 */
     initial->magic       = SHM_ALLOC_MAGIC_BLOCK;
     initial->type_tag    = 0;
@@ -684,6 +707,169 @@ static size_t dax_device_size_bytes(const char *dev_path)
     return 0;
 }
 
+/**
+ * Read the VMA that contains @p addr from /proc/self/maps.
+ * @return VMA length in bytes, or 0 on failure.
+ */
+static size_t vma_length_containing(const void *addr)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return 0;
+
+    uintptr_t needle = (uintptr_t)addr;
+    char line[256];
+    size_t found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long start = 0, end = 0;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2)
+            continue;
+        if (needle >= start && needle < end) {
+            found = (size_t)(end - start);
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/**
+ * If a DAX mmap overshot @p want_size (gem5 or kernel quirk mapping the
+ * whole device), chop the excess with munmap so offsets past shm_size
+ * become unmapped and cannot produce gem5 packets past the window.
+ */
+static void chop_dax_overmap(void *base, size_t want_size, size_t dev_size)
+{
+    if (!base || want_size < 4096)
+        return;
+
+    size_t vma_len = vma_length_containing(base);
+    size_t excess = 0;
+
+    if (vma_len > want_size)
+        excess = vma_len - want_size;
+    else if (dev_size > want_size)
+        excess = dev_size - want_size; /* try anyway; munmap fails if absent */
+
+    if (excess == 0)
+        return;
+
+    if (munmap((char *)base + want_size, excess) == 0) {
+        fprintf(stderr,
+                "shm_alloc: chopped %zu bytes past window (vma was %zu, "
+                "want %zu) — OOB past shm_size will now SIGSEGV\n",
+                excess, vma_len ? vma_len : want_size + excess, want_size);
+    }
+
+    vma_len = vma_length_containing(base);
+    if (vma_len != 0 && vma_len != want_size) {
+        fprintf(stderr,
+                "shm_alloc: WARNING VMA length %zu != requested window %zu "
+                "(gem5 OOB risk if VMA is larger)\n",
+                vma_len, want_size);
+    }
+}
+
+/**
+ * Install PROT_NONE guard pages:
+ *   1) last @p guard_bytes of the DAX/POSIX mapping (in-region)
+ *   2) anonymous PROT_NONE immediately after the mapping (post-VMA)
+ * Re-applied on every attach (mprotect is per-process).
+ */
+static int install_guard_pages(shm_region_t *reg, uint32_t guard_pages)
+{
+    size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
+    size_t guard_bytes = (size_t)guard_pages * page_sz;
+
+    reg->guard_bytes = guard_bytes;
+    reg->post_guard_bytes = 0;
+
+    if (guard_pages == 0 || guard_bytes == 0)
+        return 0;
+    if (reg->size <= guard_bytes)
+        return EINVAL;
+
+    void *in_guard = (char *)reg->base + reg->size - guard_bytes;
+    if (mprotect(in_guard, guard_bytes, PROT_NONE) != 0) {
+        int err = errno;
+        fprintf(stderr, "shm_alloc: mprotect in-region guard failed: %s\n",
+                strerror(err));
+        return err;
+    }
+
+    void *post = mmap((char *)reg->base + reg->size, guard_bytes,
+                      PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                      -1, 0);
+    if (post == MAP_FAILED) {
+        /* Non-fatal: in-region guard still catches walks within the window. */
+        fprintf(stderr,
+                "shm_alloc: WARNING post-VMA guard mmap failed (%s); "
+                "in-region guard (%zu pages) is still active at %p\n",
+                strerror(errno), (size_t)guard_pages, in_guard);
+    } else {
+        reg->post_guard_bytes = guard_bytes;
+    }
+
+    fprintf(stderr,
+            "shm_alloc: guards active — in-region PROT_NONE %zu bytes at %p "
+            "(offsets %zu..%zu)%s\n",
+            guard_bytes, in_guard,
+            reg->size - guard_bytes, reg->size,
+            reg->post_guard_bytes
+                ? "; post-VMA anonymous PROT_NONE after mapping"
+                : "");
+    return 0;
+}
+
+/* Candidate fixed VAs for create when the preferred base is busy. */
+static const uintptr_t shm_fixed_va_candidates[] = {
+    (uintptr_t)0x4000000000ULL,
+    (uintptr_t)0x5000000000ULL,
+    (uintptr_t)0x6000000000ULL,
+    (uintptr_t)0x7000000000ULL,
+    (uintptr_t)0x8000000000ULL,
+};
+
+/**
+ * Map @p size bytes at a stable high VA.  With require_fixed, never falls
+ * back to mmap(NULL) (raw shared pointers would be unsafe).
+ */
+static void *mmap_region_fixed(int fd, size_t size, uintptr_t prefer,
+                               bool require_fixed, bool *out_fixed)
+{
+    static const size_t ncands =
+        sizeof(shm_fixed_va_candidates) / sizeof(shm_fixed_va_candidates[0]);
+
+    /* Try preferred first, then the candidate list. */
+    uintptr_t try_list[6];
+    size_t ntry = 0;
+    try_list[ntry++] = prefer ? prefer : SHM_PREFERRED_MAP_BASE;
+    for (size_t i = 0; i < ncands; i++) {
+        if (shm_fixed_va_candidates[i] != try_list[0])
+            try_list[ntry++] = shm_fixed_va_candidates[i];
+    }
+
+    for (size_t i = 0; i < ntry; i++) {
+        void *base = mmap((void *)try_list[i], size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+        if (base != MAP_FAILED) {
+            if (out_fixed) *out_fixed = true;
+            return base;
+        }
+    }
+
+    if (require_fixed) {
+        if (out_fixed) *out_fixed = false;
+        return MAP_FAILED;
+    }
+
+    void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (out_fixed) *out_fixed = false;
+    return base;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Public API: region lifecycle
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -701,7 +887,9 @@ int shm_region_open(const char                   *name_or_path,
     uint32_t      flags       = opts ? opts->flags      : 0u;
     uint32_t      dir_cap     = opts ? opts->dir_capacity : 0u;
     mode_t        mode        = opts ? opts->mode        : 0;
+    uint32_t      guard_pages = opts ? opts->guard_pages : 0u;
     bool          creating    = (flags & SHM_OPEN_CREATE) != 0;
+    bool          require_fixed = (flags & SHM_OPEN_REQUIRE_FIXED) != 0;
 
     if (dir_cap == 0)  dir_cap = DIR_CAP_DEFAULT;  /* apply default dir size */
     if (mode   == 0)   mode    = 0660;              /* apply default mode */
@@ -762,6 +950,7 @@ int shm_region_open(const char                   *name_or_path,
                 if (fstat(reg->fd, &st) == 0 && (size_t)st.st_size >= 4096)
                     dev_size = (size_t)st.st_size;
             }
+            reg->dev_size = dev_size;
             if (size < 4096) {
                 /* size=0 / unspecified → map the entire device. */
                 if (dev_size < 4096) {
@@ -784,6 +973,12 @@ int shm_region_open(const char                   *name_or_path,
                 free(reg->name); free(reg);
                 return ENOSPC;
             }
+            if (dev_size >= 4096 && size < dev_size) {
+                fprintf(stderr,
+                        "shm_alloc: DAX device capacity %zu MB, mapping only "
+                        "%zu MB window (tail of device must stay unmapped)\n",
+                        dev_size / (1024 * 1024), size / (1024 * 1024));
+            }
         }
     }
 
@@ -795,17 +990,39 @@ int shm_region_open(const char                   *name_or_path,
         return EINVAL;
     }
 
-    if (creating) {
-        /* ── Creator: map exactly `size` bytes, prefer a stable VA. ── */
-        void *base = mmap((void *)SHM_PREFERRED_MAP_BASE, size,
-                          PROT_READ | PROT_WRITE,
-                          MAP_SHARED | MAP_FIXED_NOREPLACE, reg->fd, 0);
-        if (base == MAP_FAILED) {
-            base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                        reg->fd, 0);
+    /* In-region guards need room; refuse tiny windows. */
+    {
+        size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
+        size_t need_guard = (size_t)guard_pages * page_sz;
+        if (creating && guard_pages > 0 && size <= need_guard + 4096) {
+            fprintf(stderr,
+                    "shm_alloc: region %zu too small for %u guard pages\n",
+                    size, guard_pages);
+            close(reg->fd);
+            if (backend == SHM_BACKEND_POSIX && creating)
+                shm_unlink(name_or_path);
+            free(reg->name); free(reg);
+            return EINVAL;
         }
+    }
+
+    if (creating) {
+        /*
+         * Creator: map exactly `size` bytes at a stable high VA.
+         * DAX + raw pointers (memcached) must use REQUIRE_FIXED — never
+         * fall back to an ASLR address near libc (that pattern produced
+         * gem5 OOB PAs like 0x1839ADF20 when the VMA overshot shm_size).
+         */
+        bool fixed = false;
+        void *base = mmap_region_fixed(reg->fd, size, SHM_PREFERRED_MAP_BASE,
+                                       require_fixed || backend == SHM_BACKEND_DAX,
+                                       &fixed);
         if (base == MAP_FAILED) {
-            int err = errno;
+            int err = errno ? errno : EBUSY;
+            fprintf(stderr,
+                    "shm_alloc: failed to map %zu bytes at a fixed VA "
+                    "(REQUIRE_FIXED/DAX) — free 0x4000000000+ or disable ASLR\n",
+                    size);
             close(reg->fd);
             if (backend == SHM_BACKEND_POSIX) shm_unlink(name_or_path);
             free(reg->name); free(reg);
@@ -813,11 +1030,30 @@ int shm_region_open(const char                   *name_or_path,
         }
         reg->base = base;
         reg->size = size;
-        region_init(reg, size, backend, dir_cap, name_or_path);
+
+        /* Chop any over-map past the window (gem5 sometimes maps full DAX). */
+        if (backend == SHM_BACKEND_DAX)
+            chop_dax_overmap(reg->base, size, reg->dev_size);
+
+        region_init(reg, size, backend, dir_cap, name_or_path, guard_pages);
+
+        if (install_guard_pages(reg, guard_pages) != 0) {
+            munmap(reg->base, reg->size);
+            close(reg->fd);
+            if (backend == SHM_BACKEND_POSIX) shm_unlink(name_or_path);
+            free(reg->name); free(reg);
+            return EFAULT;
+        }
+
+        size_t vma_len = vma_length_containing(reg->base);
         fprintf(stderr,
-                "shm_alloc: created %s region size=%zu VA=%p map_base_addr=%p\n",
+                "shm_alloc: created %s region size=%zu VA=%p map_base_addr=%p "
+                "(%s) vma_rw=%zu guard_pages=%u\n",
                 backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
-                size, reg->base, (void *)(uintptr_t)region_hdr(reg)->map_base_addr);
+                size, reg->base,
+                (void *)(uintptr_t)region_hdr(reg)->map_base_addr,
+                fixed ? "fixed" : "relocated",
+                vma_len, guard_pages);
     } else {
         /*
          * Attacher: never map the whole DAX device.  Peek one page to read
@@ -837,17 +1073,25 @@ int shm_region_open(const char                   *name_or_path,
 
         const shm_region_hdr_t *ph = (const shm_region_hdr_t *)peek;
         if (ph->magic != SHM_ALLOC_MAGIC_REGION || ph->version != SHM_ALLOC_VERSION) {
+            fprintf(stderr,
+                    "shm_alloc: attach refused — bad magic/version "
+                    "(got version %u, need %u); wipe DAX and shm_create\n",
+                    ph->version, SHM_ALLOC_VERSION);
             munmap(peek, peek_sz);
             close(reg->fd);
             free(reg->name); free(reg);
             return ENOENT;
         }
 
-        size_t    win      = ph->region_size;
-        uintptr_t want_va  = (uintptr_t)ph->map_base_addr;
-        uint64_t  ns_inode = ph->ns_inode;
-        uint64_t  cg_hash  = ph->cgroup_hash;
+        size_t    win         = ph->region_size;
+        uintptr_t want_va     = (uintptr_t)ph->map_base_addr;
+        uint32_t  hdr_guards  = ph->guard_pages;
+        uint64_t  ns_inode    = ph->ns_inode;
+        uint64_t  cg_hash     = ph->cgroup_hash;
         munmap(peek, peek_sz);
+
+        /* Attacher ignores caller guard_pages; header is authoritative. */
+        guard_pages = hdr_guards;
 
         if (win < 4096 || want_va == 0) {
             fprintf(stderr,
@@ -878,17 +1122,26 @@ int shm_region_open(const char                   *name_or_path,
         }
 
         /*
-         * Prefer the creator's VA so raw pointers embedded in the region
-         * remain valid (memcached).  Offset-based clients still work if the
-         * fixed map fails (e.g. same-process re-open in tests, or the VA is
-         * already occupied) — callers that need raw pointers must check.
+         * Must map at the creator VA for raw pointers.  DAX and REQUIRE_FIXED
+         * refuse a relocated fallback (that is what produced PA 0x1839ADF20).
          */
+        bool require = require_fixed || backend == SHM_BACKEND_DAX;
         void *base = mmap((void *)want_va, win,
                           PROT_READ | PROT_WRITE,
                           MAP_SHARED | MAP_FIXED_NOREPLACE,
                           reg->fd, 0);
         bool fixed = (base != MAP_FAILED);
         if (!fixed) {
+            if (require) {
+                fprintf(stderr,
+                        "shm_alloc: attach FAILED — cannot map at creator VA %p "
+                        "(size=%zu). Free that address or disable ASLR; "
+                        "relocated attach is not allowed for DAX/raw pointers.\n",
+                        (void *)want_va, win);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return EBUSY;
+            }
             base = mmap(NULL, win, PROT_READ | PROT_WRITE, MAP_SHARED,
                         reg->fd, 0);
             if (base == MAP_FAILED) {
@@ -897,17 +1150,18 @@ int shm_region_open(const char                   *name_or_path,
                 free(reg->name); free(reg);
                 return err;
             }
-            if ((uintptr_t)base != want_va) {
-                fprintf(stderr,
-                        "shm_alloc: WARNING attach VA %p != creator %p "
-                        "(size=%zu) — offset API ok; raw shared pointers "
-                        "are NOT valid in this process\n",
-                        base, (void *)want_va, win);
-            }
+            fprintf(stderr,
+                    "shm_alloc: WARNING attach VA %p != creator %p "
+                    "(size=%zu) — offset API ok; raw shared pointers "
+                    "are NOT valid in this process\n",
+                    base, (void *)want_va, win);
         }
 
         reg->base = base;
         reg->size = win;
+
+        if (backend == SHM_BACKEND_DAX)
+            chop_dax_overmap(reg->base, win, reg->dev_size);
 
         shm_region_hdr_t *rh = region_hdr(reg);
         if (rh->magic != SHM_ALLOC_MAGIC_REGION || rh->version != SHM_ALLOC_VERSION
@@ -918,10 +1172,20 @@ int shm_region_open(const char                   *name_or_path,
             return ENOENT;
         }
 
+        if (install_guard_pages(reg, guard_pages) != 0) {
+            munmap(reg->base, reg->size);
+            close(reg->fd);
+            free(reg->name); free(reg);
+            return EFAULT;
+        }
+
+        size_t vma_len = vma_length_containing(reg->base);
         fprintf(stderr,
-                "shm_alloc: attached %s region size=%zu VA=%p (%s)\n",
+                "shm_alloc: attached %s region size=%zu VA=%p (%s) vma_rw=%zu "
+                "guard_pages=%u\n",
                 backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
-                win, reg->base, fixed ? "fixed" : "relocated");
+                win, reg->base, fixed ? "fixed" : "relocated",
+                vma_len, guard_pages);
     }
 
     /* ── Increment the attached host counter atomically under the mutex. ── */
@@ -944,6 +1208,12 @@ void shm_region_close(shm_region_t *region, bool unlink_name)
         if (rh->host_count > 0)
             rh->host_count--;   /* track departure of this host */
         region_unlock(region);
+
+        /* Drop post-VMA anonymous guard first (it sits at base+size). */
+        if (region->post_guard_bytes > 0) {
+            munmap((char *)region->base + region->size,
+                   region->post_guard_bytes);
+        }
         munmap(region->base, region->size);  /* release virtual address space */
     }
 

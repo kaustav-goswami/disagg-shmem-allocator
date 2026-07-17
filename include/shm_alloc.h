@@ -75,7 +75,7 @@ extern "C" {
 /** Stored at the start of every heap block header. */
 #define SHM_ALLOC_MAGIC_BLOCK   0x424C4B21u  /* "BLK!" in ASCII */
 /** Incremented every time the on-disk layout changes in a breaking way. */
-#define SHM_ALLOC_VERSION       3u
+#define SHM_ALLOC_VERSION       4u
 
 /* ── Heap-relative payload offset ───────────────────────────────────────── */
 
@@ -126,6 +126,12 @@ typedef enum shm_backend {
 #define SHM_OPEN_ENFORCE_NS      0x02u
 /** Reject the open if the caller's cgroup hash differs from the creator's. */
 #define SHM_OPEN_ENFORCE_CGROUP  0x04u
+/**
+ * Require mapping at the creator's fixed VA (or preferred VA on create).
+ * Fail with EBUSY instead of falling back to mmap(NULL).  Required for
+ * clients that embed raw C pointers in the region (memcached).
+ */
+#define SHM_OPEN_REQUIRE_FIXED   0x08u
 
 /* ── Open options ────────────────────────────────────────────────────────── */
 
@@ -138,6 +144,15 @@ typedef struct shm_region_open_opts {
     uint32_t      flags;         /* bitwise OR of SHM_OPEN_* constants */
     uint32_t      dir_capacity;  /* max objects in directory (0 → default 256) */
     mode_t        mode;          /* file permission bits (0 → 0660) */
+    /**
+     * Number of PROT_NONE pages reserved at the end of the mapped window
+     * (and mirrored as anonymous guards immediately after it).  Out-of-bounds
+     * pointer walks into this zone SIGSEGV instead of silently hitting the
+     * next DAX page (important when the device is larger than shm_size).
+     * Stored in the region header so attachers re-apply the same protection.
+     * 0 = disabled.
+     */
+    uint32_t      guard_pages;
 } shm_region_open_opts_t;
 
 /* ── Opaque region handle ────────────────────────────────────────────────── */
