@@ -195,11 +195,54 @@ static shm_block_hdr_t *blk_at_hoff(const shm_region_t *r, size_t hoff)
     return (shm_block_hdr_t *)(heap_base(r) + hoff);
 }
 
-/** Convert a heap-payload-offset (poff) to the block header that precedes it. */
-static shm_block_hdr_t *blk_of_poff(const shm_region_t *r, shm_off_t poff)
+/**
+ * Bounds-checked conversion of a heap-payload-offset (poff) to the block
+ * header that precedes it.
+ *
+ * The naive version of this helper is just pointer arithmetic with no
+ * validation: `heap_base(r) + poff - sizeof(header)`.  A caller-supplied
+ * offset that is stale, corrupted, or simply out of range (including the
+ * SHM_OFF_NULL sentinel = UINT64_MAX) turns straight into a pointer that
+ * can land far outside [heap_base, heap_base + heap_size) and get
+ * dereferenced immediately by the caller (check_block_access() reads
+ * b->magic unconditionally).  On a tightly-bounded DAX/gem5 window this is
+ * exactly the class of bug that produces "access outside the allocation"
+ * crashes; on a POSIX/DRAM-backed region the same bad offset may instead
+ * silently read/write unrelated heap memory.
+ *
+ * This helper is the single choke point every shm_off_t must pass through
+ * before being dereferenced.  It verifies:
+ *   1. off is not the null sentinel and is large enough to have a header
+ *      before it (off >= sizeof(shm_block_hdr_t)),
+ *   2. the header itself lies entirely inside the mapped heap,
+ *   3. (once the header is known to be readable) the block's own
+ *      total_size does not claim to extend past the end of the heap --
+ *      catches corrupted/poisoned headers before payload_cap is trusted.
+ *
+ * @return Pointer to the block header on success; NULL if @p poff is out
+ *         of range or the block's recorded size would overrun the heap.
+ */
+static shm_block_hdr_t *blk_of_poff_checked(const shm_region_t *r, shm_off_t poff)
 {
-    /* The block header immediately precedes the payload area. */
-    return (shm_block_hdr_t *)(heap_base(r) + poff - sizeof(shm_block_hdr_t));
+    if (!r || poff == SHM_OFF_NULL || poff < sizeof(shm_block_hdr_t))
+        return NULL;                       /* cannot precede offset 0 of the heap */
+
+    size_t hsz  = heap_size(r);
+    size_t hoff = (size_t)poff - sizeof(shm_block_hdr_t);
+
+    /* The header must start and fully fit inside the mapped heap window. */
+    if (hoff >= hsz || hoff + sizeof(shm_block_hdr_t) > hsz)
+        return NULL;
+
+    shm_block_hdr_t *b = blk_at_hoff(r, hoff);
+
+    /* Header is now known to be readable; sanity-check its own size claim
+     * before the caller trusts payload_cap / total_size for further
+     * pointer arithmetic (e.g. memset/memcpy over the payload). */
+    if (b->magic == SHM_ALLOC_MAGIC_BLOCK && hoff + b->total_size > hsz)
+        return NULL;                       /* corrupted header: refuse it */
+
+    return b;
 }
 
 /** Convert a block pointer to its heap-header-offset. */
@@ -576,8 +619,20 @@ static void region_init(shm_region_t *r, size_t total_size,
         guard_pages = 0;
     }
 
+    /*
+     * Defence in depth against a size_t underflow below: if the mapping is
+     * so small that the header + directory alone exceed it (should already
+     * be rejected by the size check in shm_region_open(), but a future
+     * caller of this internal function must not be able to bypass it),
+     * `total_size - data_off` would wrap around to a huge value and hand
+     * out a heap that claims to be several exabytes.  Every subsequent
+     * shm_alloc() would then compute pointers far outside the mapping.
+     * Clamp to an empty, unusable heap instead of ever letting that happen.
+     */
+    bool heap_fits = (total_size > data_off + guard_bytes);
+
     /* Step 2: zero the usable part of the mapping (skip PROT_NONE guard). */
-    memset(r->base, 0, total_size - guard_bytes);
+    memset(r->base, 0, heap_fits ? total_size - guard_bytes : total_size);
 
     /* Step 3: fill in the region header. */
     shm_region_hdr_t *rh = region_hdr(r);
@@ -616,21 +671,32 @@ static void region_init(shm_region_t *r, size_t total_size,
     pthread_mutexattr_destroy(&attr);
 
     /* Step 5: create the initial single free block covering the usable heap
-     * (everything except the trailing PROT_NONE guard pages). */
-    size_t heap_sz = total_size - data_off - guard_bytes;
-    shm_block_hdr_t *initial = blk_at_hoff(r, 0);  /* first block at hoff=0 */
-    initial->magic       = SHM_ALLOC_MAGIC_BLOCK;
-    initial->type_tag    = 0;
-    initial->owner       = 0;
-    initial->perms       = 0;
-    initial->allocated   = 0;                      /* mark as free */
-    initial->obj_id      = 0;
-    initial->payload_cap = heap_sz - sizeof(shm_block_hdr_t);
-    initial->total_size  = heap_sz;
-    initial->next_free   = 0;                      /* only block; no successor */
+     * (everything except the trailing PROT_NONE guard pages).
+     *
+     * heap_fits==false means the mapping is too small to hold even one
+     * minimal block after the header+directory; leave the heap empty
+     * (free_list = 0) instead of computing an underflowed, bogus size. */
+    size_t heap_sz = heap_fits ? (total_size - data_off - guard_bytes) : 0;
 
-    /* The free list starts with this single block at hoff=0 → link=1. */
-    rh->free_list = link_enc(0);
+    if (heap_sz >= BLOCK_MIN) {
+        shm_block_hdr_t *initial = blk_at_hoff(r, 0);  /* first block at hoff=0 */
+        initial->magic       = SHM_ALLOC_MAGIC_BLOCK;
+        initial->type_tag    = 0;
+        initial->owner       = 0;
+        initial->perms       = 0;
+        initial->allocated   = 0;                      /* mark as free */
+        initial->obj_id      = 0;
+        initial->payload_cap = heap_sz - sizeof(shm_block_hdr_t);
+        initial->total_size  = heap_sz;
+        initial->next_free   = 0;                      /* only block; no successor */
+
+        /* The free list starts with this single block at hoff=0 → link=1. */
+        rh->free_list = link_enc(0);
+    } else {
+        /* No usable heap at all; every shm_alloc() will correctly fail
+         * with ENOMEM instead of writing past the mapping. */
+        rh->free_list = 0;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -853,6 +919,27 @@ static int install_guard_pages(shm_region_t *reg, uint32_t guard_pages)
         return EFAULT;
     }
 
+    if (!in_ok) {
+        /*
+         * The in-region trailing guard did NOT get applied (DAX munmap
+         * failed — this happens on some kernels/device-dax drivers).  The
+         * allocator's own accounting still excludes this range from the
+         * usable heap (see heap_size()), so shm_alloc() will never legally
+         * hand these bytes out.  But because the range is still live,
+         * writable DAX memory, an out-of-bounds pointer bug elsewhere that
+         * lands in exactly this window will silently succeed instead of
+         * SIGSEGV'ing — making such bugs *harder* to catch here, not
+         * impossible.  Say so loudly instead of claiming "guards active".
+         */
+        fprintf(stderr,
+                "shm_alloc: WARNING in-region guard NOT enforced — bytes "
+                "%zu..%zu at %p remain live/writable DAX memory (heap "
+                "accounting excludes them, but a stray OOB write there "
+                "will not fault); only the post-VMA guard is active\n",
+                reg->size - guard_bytes, reg->size, in_guard);
+        return 0;
+    }
+
     fprintf(stderr,
             "shm_alloc: guards active — in-region %s %zu bytes at %p "
             "(offsets %zu..%zu)%s\n",
@@ -1044,6 +1131,36 @@ int shm_region_open(const char                   *name_or_path,
             close(reg->fd);
             if (backend == SHM_BACKEND_POSIX && creating)
                 shm_unlink(name_or_path);
+            free(reg->name); free(reg);
+            return EINVAL;
+        }
+    }
+
+    /*
+     * The region must be large enough to hold the header + object
+     * directory + at least one minimal heap block.  region_init() has a
+     * defensive fallback for this (it disables guard pages and, failing
+     * that, leaves the heap empty) so it can never underflow into a bogus
+     * multi-exabyte "free" block -- but callers should get a clear EINVAL
+     * up front instead of silently ending up with zero usable heap bytes.
+     * This mirrors the exact layout formula used in region_init(); keep
+     * the two in sync if the header/directory layout ever changes.
+     */
+    if (creating) {
+        size_t page_sz    = (size_t)sysconf(_SC_PAGESIZE);
+        size_t hdr_sz      = align_up(sizeof(shm_region_hdr_t), HEAP_ALIGN);
+        size_t dir_sz       = align_up((size_t)dir_cap * sizeof(shm_obj_entry_t), HEAP_ALIGN);
+        size_t data_off     = hdr_sz + dir_sz;
+        size_t guard_bytes  = (size_t)guard_pages * page_sz;
+        if (size <= data_off + guard_bytes + BLOCK_MIN) {
+            fprintf(stderr,
+                    "shm_alloc: region %zu bytes too small for header (%zu) + "
+                    "directory (%zu slots, %zu bytes) + guard (%zu bytes) + "
+                    "one minimal heap block (%zu bytes)\n",
+                    size, hdr_sz, (size_t)dir_cap, dir_sz, guard_bytes,
+                    (size_t)BLOCK_MIN);
+            close(reg->fd);
+            if (backend == SHM_BACKEND_POSIX) shm_unlink(name_or_path);
             free(reg->name); free(reg);
             return EINVAL;
         }
@@ -1378,8 +1495,15 @@ int shm_free(shm_region_t *region,
         return acc;
     }
 
-    /* Retrieve the block header from the stored payload offset. */
-    shm_block_hdr_t *b = blk_of_poff(region, slot->off);
+    /* Retrieve the block header from the stored payload offset.  The
+     * directory entry is normally trustworthy (it was written by a prior
+     * shm_alloc()/shm_resize() call), but validate anyway: a corrupted or
+     * torn-read directory slot must not turn into a wild free(). */
+    shm_block_hdr_t *b = blk_of_poff_checked(region, slot->off);
+    if (!b) {
+        region_unlock(region);
+        return EFAULT;    /* directory entry points outside the heap */
+    }
 
     /* Return the block to the heap free list. */
     heap_free_block(region, b);
@@ -1417,7 +1541,11 @@ int shm_resize(shm_region_t *region,
         return acc;
     }
 
-    shm_block_hdr_t *b = blk_of_poff(region, slot->off);
+    shm_block_hdr_t *b = blk_of_poff_checked(region, slot->off);
+    if (!b) {
+        region_unlock(region);
+        return EFAULT;    /* directory entry points outside the heap */
+    }
     size_t new_total = align_up(sizeof(shm_block_hdr_t) + new_size, HEAP_ALIGN);
 
     if (new_total <= b->total_size) {
@@ -1638,8 +1766,10 @@ void *shm_ptr(const shm_region_t *region,
 {
     if (!region) return NULL;
 
-    /* The block header lives sizeof(shm_block_hdr_t) bytes before the payload. */
-    shm_block_hdr_t *b = blk_of_poff(region, off);
+    /* The block header lives sizeof(shm_block_hdr_t) bytes before the
+     * payload.  Bounds-checked: an out-of-range off must never turn into
+     * a wild pointer that check_block_access() then dereferences. */
+    shm_block_hdr_t *b = blk_of_poff_checked(region, off);
 
     /* Validate magic and check ownership + permissions. */
     if (check_block_access(b, user_id, caller_perms, required_perms) != 0)
@@ -1659,10 +1789,10 @@ int shm_block_info(const shm_region_t *region,
 {
     if (!region) return EINVAL;
 
-    shm_block_hdr_t *b = blk_of_poff(region, off);
+    shm_block_hdr_t *b = blk_of_poff_checked(region, off);
 
     if (!b || b->magic != SHM_ALLOC_MAGIC_BLOCK)
-        return EINVAL;   /* block header is corrupt or offset is wrong */
+        return EINVAL;   /* block header is corrupt, or offset is out of range */
 
     /* Populate each optional output parameter if the pointer is non-NULL. */
     if (out_payload_cap) *out_payload_cap = b->payload_cap;
@@ -1684,7 +1814,7 @@ int shm_block_set_perms(shm_region_t *region,
 
     region_lock(region);
 
-    shm_block_hdr_t *b = blk_of_poff(region, off);
+    shm_block_hdr_t *b = blk_of_poff_checked(region, off);
 
     /* Only the owner or an admin may change permissions. */
     int acc = check_block_access(b, user_id, caller_perms, SHM_PERM_WRITE);
