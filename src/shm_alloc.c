@@ -1189,28 +1189,38 @@ int shm_region_open(const char                   *name_or_path,
                 vma_len, guard_pages);
     } else {
         /*
-         * Attacher: never map the whole DAX device.  Peek one page to read
-         * region_size + map_base_addr, then map exactly that window at the
-         * creator's VA so raw pointers embedded in the region stay valid and
-         * DAX-relative offsets cannot exceed the gem5/shm_size window.
+         * Attacher: never map the whole DAX device.  Read the region header
+         * with pread() (not a temporary mmap) so a second attach still works
+         * when the backend allows only one DAX mmap at a time (common in QEMU
+         * virtio-dax).  Then map exactly region_size bytes at the creator VA.
          */
-        const size_t peek_sz = 4096;
-        void *peek = mmap(NULL, peek_sz, PROT_READ | PROT_WRITE, MAP_SHARED,
-                          reg->fd, 0);
-        if (peek == MAP_FAILED) {
+        shm_region_hdr_t hdr_peek;
+        ssize_t got = pread(reg->fd, &hdr_peek, sizeof(hdr_peek), 0);
+        if (got < 0) {
             int err = errno;
+            fprintf(stderr,
+                    "shm_alloc: attach failed — pread('%s', header) failed: %s\n",
+                    name_or_path, strerror(err));
             close(reg->fd);
             free(reg->name); free(reg);
             return err;
         }
+        if ((size_t)got < sizeof(uint32_t) * 2u) {
+            fprintf(stderr,
+                    "shm_alloc: attach refused — short read (%zd bytes) from '%s'\n",
+                    got, name_or_path);
+            close(reg->fd);
+            free(reg->name); free(reg);
+            return EINVAL;
+        }
 
-        const shm_region_hdr_t *ph = (const shm_region_hdr_t *)peek;
+        const shm_region_hdr_t *ph = &hdr_peek;
         if (ph->magic != SHM_ALLOC_MAGIC_REGION || ph->version != SHM_ALLOC_VERSION) {
             fprintf(stderr,
                     "shm_alloc: attach refused — bad magic/version "
-                    "(got version %u, need %u); wipe DAX and shm_create\n",
-                    ph->version, SHM_ALLOC_VERSION);
-            munmap(peek, peek_sz);
+                    "(magic=0x%x version=%u, need version %u); "
+                    "start creator with shm_create first or wipe DAX\n",
+                    ph->magic, ph->version, SHM_ALLOC_VERSION);
             close(reg->fd);
             free(reg->name); free(reg);
             return ENOENT;
@@ -1221,7 +1231,6 @@ int shm_region_open(const char                   *name_or_path,
         uint32_t  hdr_guards  = ph->guard_pages;
         uint64_t  ns_inode    = ph->ns_inode;
         uint64_t  cg_hash     = ph->cgroup_hash;
-        munmap(peek, peek_sz);
 
         /* Attacher ignores caller guard_pages; header is authoritative. */
         guard_pages = hdr_guards;
@@ -1268,9 +1277,9 @@ int shm_region_open(const char                   *name_or_path,
             if (require) {
                 fprintf(stderr,
                         "shm_alloc: attach FAILED — cannot map at creator VA %p "
-                        "(size=%zu). Free that address or disable ASLR; "
+                        "(size=%zu, errno=%s). Free that address or disable ASLR; "
                         "relocated attach is not allowed for DAX/raw pointers.\n",
-                        (void *)want_va, win);
+                        (void *)want_va, win, strerror(errno));
                 close(reg->fd);
                 free(reg->name); free(reg);
                 return EBUSY;
@@ -1279,6 +1288,10 @@ int shm_region_open(const char                   *name_or_path,
                         reg->fd, 0);
             if (base == MAP_FAILED) {
                 int err = errno;
+                fprintf(stderr,
+                        "shm_alloc: attach failed — mmap('%s', %zu bytes) "
+                        "failed: %s\n",
+                        name_or_path, win, strerror(err));
                 close(reg->fd);
                 free(reg->name); free(reg);
                 return err;
