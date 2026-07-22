@@ -1189,66 +1189,150 @@ int shm_region_open(const char                   *name_or_path,
                 vma_len, guard_pages);
     } else {
         /*
-         * Attacher: never map the whole DAX device.  Read the region header
-         * with pread() (not a temporary mmap) so a second attach still works
-         * when the backend allows only one DAX mmap at a time (common in QEMU
-         * virtio-dax).  Then map exactly region_size bytes at the creator VA.
+         * Attacher: read region_size + map_base_addr from the header, then map
+         * exactly that window at the creator VA.  Prefer pread(); when the DAX
+         * backend rejects pread() (gem5 virtio-dax) fall back to a single
+         * MAP_FIXED mmap using the caller's size hint (-m / shm_size).
          */
-        shm_region_hdr_t hdr_peek;
-        ssize_t got = pread(reg->fd, &hdr_peek, sizeof(hdr_peek), 0);
-        if (got < 0) {
-            int err = errno;
-            fprintf(stderr,
-                    "shm_alloc: attach failed — pread('%s', header) failed: %s\n",
-                    name_or_path, strerror(err));
-            close(reg->fd);
-            free(reg->name); free(reg);
-            return err;
-        }
-        if ((size_t)got < sizeof(uint32_t) * 2u) {
-            fprintf(stderr,
-                    "shm_alloc: attach refused — short read (%zd bytes) from '%s'\n",
-                    got, name_or_path);
-            close(reg->fd);
-            free(reg->name); free(reg);
-            return EINVAL;
-        }
+        size_t            win         = 0;
+        uintptr_t         want_va     = 0;
+        uint64_t          ns_inode    = 0;
+        uint64_t          cg_hash     = 0;
+        bool              already_mapped = false;
+        bool              fixed       = false;
+        void             *base        = NULL;
+        shm_region_hdr_t  hdr_peek;
+        const shm_region_hdr_t *ph    = NULL;
 
-        const shm_region_hdr_t *ph = &hdr_peek;
-        if (ph->magic != SHM_ALLOC_MAGIC_REGION || ph->version != SHM_ALLOC_VERSION) {
+        ssize_t got = pread(reg->fd, &hdr_peek, sizeof(hdr_peek), 0);
+        if (got >= (ssize_t)(sizeof(uint32_t) * 2u)
+                && hdr_peek.magic == SHM_ALLOC_MAGIC_REGION
+                && hdr_peek.version == SHM_ALLOC_VERSION) {
+            ph = &hdr_peek;
+        } else if (backend == SHM_BACKEND_DAX && size >= 4096) {
+            const char *why = (got < 0) ? strerror(errno)
+                                          : "header not initialized";
+            fprintf(stderr,
+                    "shm_alloc: DAX attach — pread('%s') unusable (%s); "
+                    "trying mmap-only attach at fixed VA (hint size=%zu)\n",
+                    name_or_path, why, size);
+
+            base = mmap_region_fixed(reg->fd, size, SHM_PREFERRED_MAP_BASE,
+                                     true, &fixed);
+            if (base == MAP_FAILED) {
+                int err = errno ? errno : EBUSY;
+                fprintf(stderr,
+                        "shm_alloc: DAX mmap-only attach failed for %zu bytes "
+                        "at fixed VA (errno=%s)\n",
+                        size, strerror(errno));
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return err;
+            }
+
+            memcpy(&hdr_peek, base, sizeof(hdr_peek));
+            ph = &hdr_peek;
+            if (ph->magic != SHM_ALLOC_MAGIC_REGION
+                    || ph->version != SHM_ALLOC_VERSION) {
+                fprintf(stderr,
+                        "shm_alloc: DAX mmap-only attach — bad magic/version "
+                        "at VA %p (magic=0x%x version=%u); run creator with "
+                        "shm_create first\n",
+                        base, ph->magic, ph->version);
+                munmap(base, size);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return ENOENT;
+            }
+
+            want_va = (uintptr_t)ph->map_base_addr;
+            if (want_va == 0
+                    || (uintptr_t)base != want_va) {
+                fprintf(stderr,
+                        "shm_alloc: DAX mmap-only attach — VA mismatch "
+                        "(mapped=%p header map_base_addr=%p); re-create region\n",
+                        base, (void *)want_va);
+                munmap(base, size);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return EINVAL;
+            }
+
+            win = ph->region_size;
+            if (win < 4096 || win > size) {
+                fprintf(stderr,
+                        "shm_alloc: DAX mmap-only attach — header region_size "
+                        "%zu inconsistent with attach hint %zu\n",
+                        win, size);
+                munmap(base, size);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return EINVAL;
+            }
+
+            reg->base = base;
+            reg->size = win;
+            already_mapped = true;
+        } else {
+            if (got < 0) {
+                int err = errno;
+                fprintf(stderr,
+                        "shm_alloc: attach failed — pread('%s', header) failed: %s",
+                        name_or_path, strerror(err));
+                if (backend == SHM_BACKEND_DAX) {
+                    fprintf(stderr,
+                            " (pass -m / -o shm_size matching the creator)");
+                }
+                fprintf(stderr, "\n");
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return err;
+            }
+            if ((size_t)got < sizeof(uint32_t) * 2u) {
+                fprintf(stderr,
+                        "shm_alloc: attach refused — short read (%zd bytes) "
+                        "from '%s'\n",
+                        got, name_or_path);
+                close(reg->fd);
+                free(reg->name); free(reg);
+                return EINVAL;
+            }
             fprintf(stderr,
                     "shm_alloc: attach refused — bad magic/version "
                     "(magic=0x%x version=%u, need version %u); "
                     "start creator with shm_create first or wipe DAX\n",
-                    ph->magic, ph->version, SHM_ALLOC_VERSION);
+                    hdr_peek.magic, hdr_peek.version, SHM_ALLOC_VERSION);
             close(reg->fd);
             free(reg->name); free(reg);
             return ENOENT;
         }
 
-        size_t    win         = ph->region_size;
-        uintptr_t want_va     = (uintptr_t)ph->map_base_addr;
-        uint32_t  hdr_guards  = ph->guard_pages;
-        uint64_t  ns_inode    = ph->ns_inode;
-        uint64_t  cg_hash     = ph->cgroup_hash;
-
-        /* Attacher ignores caller guard_pages; header is authoritative. */
-        guard_pages = hdr_guards;
+        if (!already_mapped) {
+            win         = ph->region_size;
+            want_va     = (uintptr_t)ph->map_base_addr;
+        }
+        guard_pages = ph->guard_pages;
+        ns_inode    = ph->ns_inode;
+        cg_hash     = ph->cgroup_hash;
 
         if (win < 4096 || want_va == 0) {
             fprintf(stderr,
                     "shm_alloc: attach refused — region_size=%zu map_base_addr=%p "
                     "(re-create the region with a current shm_alloc)\n",
                     win, (void *)want_va);
+            if (already_mapped)
+                munmap(reg->base, reg->size);
             close(reg->fd);
             free(reg->name); free(reg);
             return EINVAL;
         }
 
-        /* Optional namespace / cgroup checks use values captured from the peek. */
+        /* Optional namespace / cgroup checks use values captured from the header. */
         if ((flags & SHM_OPEN_ENFORCE_NS) && ns_inode != 0) {
             uint64_t my_ns = shm_ns_ipc_inode();
             if (my_ns != 0 && my_ns != ns_inode) {
+                if (already_mapped)
+                    munmap(reg->base, reg->size);
                 close(reg->fd);
                 free(reg->name); free(reg);
                 return EPERM;
@@ -1257,54 +1341,61 @@ int shm_region_open(const char                   *name_or_path,
         if ((flags & SHM_OPEN_ENFORCE_CGROUP) && cg_hash != 0) {
             uint64_t my_cg = shm_ns_cgroup_hash();
             if (my_cg != 0 && my_cg != cg_hash) {
+                if (already_mapped)
+                    munmap(reg->base, reg->size);
                 close(reg->fd);
                 free(reg->name); free(reg);
                 return EPERM;
             }
         }
 
-        /*
-         * Must map at the creator VA for raw pointers.  DAX and REQUIRE_FIXED
-         * refuse a relocated fallback (that is what produced PA 0x1839ADF20).
-         */
-        bool require = require_fixed || backend == SHM_BACKEND_DAX;
-        void *base = mmap((void *)want_va, win,
-                          PROT_READ | PROT_WRITE,
-                          MAP_SHARED | MAP_FIXED_NOREPLACE,
-                          reg->fd, 0);
-        bool fixed = (base != MAP_FAILED);
-        if (!fixed) {
-            if (require) {
-                fprintf(stderr,
-                        "shm_alloc: attach FAILED — cannot map at creator VA %p "
-                        "(size=%zu, errno=%s). Free that address or disable ASLR; "
-                        "relocated attach is not allowed for DAX/raw pointers.\n",
-                        (void *)want_va, win, strerror(errno));
-                close(reg->fd);
-                free(reg->name); free(reg);
-                return EBUSY;
-            }
-            base = mmap(NULL, win, PROT_READ | PROT_WRITE, MAP_SHARED,
+        if (!already_mapped) {
+            /*
+             * Must map at the creator VA for raw pointers.  DAX and
+             * REQUIRE_FIXED refuse a relocated fallback.
+             */
+            bool require = require_fixed || backend == SHM_BACKEND_DAX;
+            base = mmap((void *)want_va, win,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_FIXED_NOREPLACE,
                         reg->fd, 0);
-            if (base == MAP_FAILED) {
-                int err = errno;
+            fixed = (base != MAP_FAILED);
+            if (!fixed) {
+                if (require) {
+                    fprintf(stderr,
+                            "shm_alloc: attach FAILED — cannot map at creator VA %p "
+                            "(size=%zu, errno=%s). Free that address or disable ASLR; "
+                            "relocated attach is not allowed for DAX/raw pointers.\n",
+                            (void *)want_va, win, strerror(errno));
+                    close(reg->fd);
+                    free(reg->name); free(reg);
+                    return EBUSY;
+                }
+                base = mmap(NULL, win, PROT_READ | PROT_WRITE, MAP_SHARED,
+                            reg->fd, 0);
+                if (base == MAP_FAILED) {
+                    int err = errno;
+                    fprintf(stderr,
+                            "shm_alloc: attach failed — mmap('%s', %zu bytes) "
+                            "failed: %s\n",
+                            name_or_path, win, strerror(err));
+                    close(reg->fd);
+                    free(reg->name); free(reg);
+                    return err;
+                }
                 fprintf(stderr,
-                        "shm_alloc: attach failed — mmap('%s', %zu bytes) "
-                        "failed: %s\n",
-                        name_or_path, win, strerror(err));
-                close(reg->fd);
-                free(reg->name); free(reg);
-                return err;
+                        "shm_alloc: WARNING attach VA %p != creator %p "
+                        "(size=%zu) — offset API ok; raw shared pointers "
+                        "are NOT valid in this process\n",
+                        base, (void *)want_va, win);
             }
-            fprintf(stderr,
-                    "shm_alloc: WARNING attach VA %p != creator %p "
-                    "(size=%zu) — offset API ok; raw shared pointers "
-                    "are NOT valid in this process\n",
-                    base, (void *)want_va, win);
-        }
 
-        reg->base = base;
-        reg->size = win;
+            reg->base = base;
+            reg->size = win;
+        } else {
+            base  = reg->base;
+            fixed = true;
+        }
 
         if (backend == SHM_BACKEND_DAX)
             chop_dax_overmap(reg->base, win, reg->dev_size);
@@ -1327,10 +1418,11 @@ int shm_region_open(const char                   *name_or_path,
 
         size_t vma_len = vma_length_containing(reg->base);
         fprintf(stderr,
-                "shm_alloc: attached %s region size=%zu VA=%p (%s) vma_rw=%zu "
+                "shm_alloc: attached %s region size=%zu VA=%p (%s%s) vma_rw=%zu "
                 "guard_pages=%u\n",
                 backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
                 win, reg->base, fixed ? "fixed" : "relocated",
+                already_mapped ? ", mmap-only" : "",
                 vma_len, guard_pages);
     }
 

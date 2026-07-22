@@ -208,8 +208,9 @@ typedef struct shm_pool_stats {
  *
  * @param name_or_path  Name for POSIX or device path for DAX.
  * @param size          Desired mapping size (bytes, must be ≥ 4096).
- *                      Ignored for non-creating opens (size is read from the
- *                      existing object / region header).
+ *                      For non-creating opens the header normally supplies the
+ *                      size via pread(); on DAX backends that reject pread()
+ *                      (e.g. gem5), pass the same size the creator used.
  *                      For DAX create: pass the intended window size (≤ device);
  *                      pass 0 to map the entire device.  An explicit size larger
  *                      than the device returns ENOSPC.
