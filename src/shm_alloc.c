@@ -20,9 +20,8 @@
  *
  * Concurrency
  * ───────────
- *  A single process-shared robust pthread_mutex_t serialises all mutations.
- *  Read-only queries (shm_ptr, shm_block_info) lock briefly to prevent
- *  torn reads; shm_dir_next does not lock (best-effort snapshot).
+ *  No pthread mutex on the region header: callers rely on platform coherence
+ *  (gem5/DAX).  region_lock()/region_unlock() are no-ops.
  */
 
 #define _GNU_SOURCE      /* MAP_FIXED_NOREPLACE, shm_open, strdup */
@@ -32,7 +31,6 @@
 
 #include <errno.h>       /* errno, EINVAL, ENOMEM, EACCES, ENOENT, ENOSPC */
 #include <fcntl.h>       /* O_RDWR, O_CREAT for shm_open / open */
-#include <pthread.h>     /* pthread_mutex_t, pthread_mutexattr_* */
 #include <stdbool.h>     /* bool, true, false */
 #include <stddef.h>      /* size_t, NULL */
 #include <stdint.h>      /* uint8_t, uint32_t, uint64_t */
@@ -102,12 +100,14 @@ typedef struct shm_block_hdr {
  * Region header.  Lives at base[0]; the rest of the layout is derived from
  * the dir_offset and data_offset fields stored here.
  */
+#define SHM_REGION_SYNC_PAD 40
+
 typedef struct shm_region_hdr {
     uint32_t        magic;          /* SHM_ALLOC_MAGIC_REGION */
     uint32_t        version;        /* SHM_ALLOC_VERSION */
     uint32_t        backend;        /* shm_backend_t cast to uint32 */
     uint32_t        dir_capacity;   /* number of directory slots */
-    pthread_mutex_t mutex;          /* process-shared robust mutex */
+    uint8_t         sync_pad[SHM_REGION_SYNC_PAD]; /* reserved (was mutex) */
     uint32_t        host_count;     /* how many processes are attached */
     uint32_t        _pad0;
     size_t          region_size;    /* total mapping size in bytes */
@@ -658,19 +658,7 @@ static void region_init(shm_region_t *r, size_t total_size,
     if (name)
         strncpy(rh->shm_name, name, sizeof(rh->shm_name) - 1);
 
-    /* Step 4: initialise the process-shared robust mutex. */
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    /* PTHREAD_PROCESS_SHARED allows the mutex to be used across processes
-     * that map the same shared-memory region. */
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    /* PTHREAD_MUTEX_ROBUST causes the mutex to be recoverable if the owner
-     * dies while holding it (the next lock attempt returns EOWNERDEAD). */
-    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-    pthread_mutex_init(&rh->mutex, &attr);
-    pthread_mutexattr_destroy(&attr);
-
-    /* Step 5: create the initial single free block covering the usable heap
+    /* Step 4: create the initial single free block covering the usable heap
      * (everything except the trailing PROT_NONE guard pages).
      *
      * heap_fits==false means the mapping is too small to hold even one
@@ -700,33 +688,18 @@ static void region_init(shm_region_t *r, size_t total_size,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Mutex helpers  (handle EOWNERDEAD recovery)
+ *  Region lock stubs (no atomics on DAX metadata)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/**
- * Lock the region mutex.  Handles the EOWNERDEAD case where a process died
- * while holding the lock by calling pthread_mutex_consistent() to recover.
- *
- * @return 0 on success; an errno on unrecoverable failure.
- */
 static int region_lock(shm_region_t *r)
 {
-    shm_region_hdr_t *rh = region_hdr(r);
-    int rc = pthread_mutex_lock(&rh->mutex);
-
-    if (rc == EOWNERDEAD) {
-        /* The previous owner died; mark the mutex as consistent so it can
-         * be used again.  The heap may be in an inconsistent state, but for
-         * many use-cases partial recovery is better than refusing all access. */
-        pthread_mutex_consistent(&rh->mutex);
-        rc = 0;  /* treat as successful lock; caller should re-validate state */
-    }
-    return rc;
+    (void)r;
+    return 0;
 }
 
 static void region_unlock(shm_region_t *r)
 {
-    pthread_mutex_unlock(&region_hdr(r)->mutex);
+    (void)r;
 }
 
 /*
