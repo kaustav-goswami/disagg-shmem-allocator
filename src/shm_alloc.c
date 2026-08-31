@@ -490,7 +490,15 @@ static shm_block_hdr_t *heap_alloc_block(shm_region_t *r, size_t need_total)
                 else
                     blk_of_link(r, prev_lnk)->next_free = nb_lnk;
             } else {
-                /* Remainder is too small; absorb it (internal fragmentation). */
+                /* Remainder is too small; absorb it (internal fragmentation).
+                 * b->total_size may already reflect a coalesced free block
+                 * (freelist_insert merges adjacent free neighbors and grows
+                 * total_size, but does not touch payload_cap). Refresh
+                 * payload_cap here so it always matches total_size - header;
+                 * otherwise a later shm_resize() relocation reads this stale,
+                 * too-small payload_cap as its memcpy length and silently
+                 * drops already-written payload bytes past the old capacity. */
+                b->payload_cap = b->total_size - sizeof(shm_block_hdr_t);
                 if (prev_lnk == 0)
                     rh->free_list = b->next_free;
                 else

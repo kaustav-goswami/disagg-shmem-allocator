@@ -195,6 +195,99 @@ static void test_grow_with_relocation(void)
     shm_region_close(r, true);
 }
 
+static void test_grow_relocation_after_coalesce_absorb(void)
+{
+    puts("\n[test_grow_relocation_after_coalesce_absorb]");
+
+    /* Regression test for a bug where growing an object via two consecutive
+     * relocations could silently drop previously-written payload bytes.
+     *
+     * Root cause: when shm_resize() relocates a growing object into a free
+     * block created by coalescing two adjacent free neighbors, and that
+     * coalesced block is used whole (the leftover remainder is too small to
+     * split off), heap_alloc_block()'s "absorb" branch left payload_cap
+     * stale - still matching the block's size from BEFORE it absorbed its
+     * neighbor, since only freelist_insert()'s coalescing touches total_size.
+     * A *second* growing relocation of the same object then read that stale,
+     * too-small payload_cap as its memcpy length, truncating the copy and
+     * silently losing any data written past the stale capacity. */
+
+    shm_region_t *r = NULL;
+    shm_region_open_opts_t opts = {
+        .backend = SHM_BACKEND_POSIX, .flags = SHM_OPEN_CREATE
+    };
+    shm_region_open("/shm_test_resize_coalesce_absorb", 1 << 20, &opts, &r);
+
+    const shm_user_id_t uid   = 1;
+    const shm_perm_t    perms = SHM_PERM_DEFAULT;
+
+    /* Layout: [prior_a][prior_b][growing][filler] - all 256 bytes each.
+     * Freeing prior_a then prior_b coalesces them into one free block
+     * adjacent to "growing"'s eventual relocation target; "filler" blocks
+     * in-place growth of "growing" so it must relocate via heap_alloc_block. */
+    uint64_t id_a; shm_off_t off_a;
+    shm_alloc(r, 256, "prior_a", uid, perms, 0, &id_a, &off_a);
+    uint64_t id_b; shm_off_t off_b;
+    shm_alloc(r, 256, "prior_b", uid, perms, 0, &id_b, &off_b);
+    uint64_t id_g; shm_off_t off_g;
+    shm_alloc(r, 256, "growing", uid, perms, 0, &id_g, &off_g);
+    uint64_t id_f; shm_off_t off_f;
+    shm_alloc(r, 256, "filler", uid, perms, 0, &id_f, &off_f);
+
+    /* Seed "growing"'s first 256 bytes with a marker before any resize. */
+    void *pg = shm_ptr(r, off_g, uid, perms, SHM_PERM_WRITE);
+    fill_bytes(pg, 256, 0xA1);
+
+    /* Free A then B: they are adjacent in memory, so freeing B coalesces it
+     * with the already-free A into one larger free block. */
+    shm_free(r, id_a, uid, perms);
+    shm_free(r, id_b, uid, perms);
+
+    /* Grow "growing" to 512 bytes. "filler" blocks in-place growth, so this
+     * must relocate - into the coalesced A+B block if it is the first fit. */
+    int rc = shm_resize(r, id_g, 512, uid, perms);
+    CHECK_OK(rc, "first grow-with-relocation returns 0");
+
+    shm_off_t off_g2; size_t used_g2;
+    shm_lookup(r, id_g, uid, SHM_PERM_READ, &off_g2, &used_g2);
+    CHECK(used_g2 == 512, "used_size is 512 after first grow");
+
+    /* Write a second marker into the newly grown second half. */
+    void *pg2 = shm_ptr(r, off_g2, uid, perms, SHM_PERM_WRITE);
+    fill_bytes((char *)pg2 + 256, 256, 0xB2);
+    CHECK(check_bytes(pg2, 256, 0xA1), "first-half marker intact right after first grow");
+
+    /* "growing"'s old (now-freed) 256-byte slot sits immediately after its
+     * new location, which would otherwise let the next resize grow in place
+     * by absorbing it (a correctly-implemented path that isn't where the bug
+     * lives). Pin that slot with another live allocation so the next resize
+     * is forced to relocate via heap_alloc_block() instead. */
+    uint64_t id_pin; shm_off_t off_pin;
+    shm_alloc(r, 256, "pin_old_slot", uid, perms, 0, &id_pin, &off_pin);
+
+    /* Grow again to 768 bytes, forcing a second relocation. This is where
+     * the stale payload_cap bug caused the memcpy to under-copy and drop
+     * the second-half marker written above. */
+    rc = shm_resize(r, id_g, 768, uid, perms);
+    CHECK_OK(rc, "second grow-with-relocation returns 0");
+
+    shm_off_t off_g3; size_t used_g3;
+    shm_lookup(r, id_g, uid, SHM_PERM_READ, &off_g3, &used_g3);
+    CHECK(used_g3 == 768, "used_size is 768 after second grow");
+
+    const void *pg3 = shm_ptr(r, off_g3, uid, perms, SHM_PERM_READ);
+    CHECK(check_bytes(pg3, 256, 0xA1),
+          "first-half marker survives second relocation");
+    CHECK(check_bytes((const char *)pg3 + 256, 256, 0xB2),
+          "second-half marker survives second relocation "
+          "(regression: was silently dropped by the stale payload_cap bug)");
+
+    shm_free(r, id_g, uid, perms);
+    shm_free(r, id_f, uid, perms);
+    shm_free(r, id_pin, uid, perms);
+    shm_region_close(r, true);
+}
+
 static void test_resize_permission_check(void)
 {
     puts("\n[test_resize_permission_check]");
@@ -232,6 +325,7 @@ int main(void)
     test_shrink();
     test_grow_in_place();
     test_grow_with_relocation();
+    test_grow_relocation_after_coalesce_absorb();
     test_resize_permission_check();
 
     if (g_failed) {
