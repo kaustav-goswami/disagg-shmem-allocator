@@ -157,6 +157,40 @@ static inline shm_block_hdr_t *shm_blk_of_poff(const shm_region_t *r, shm_off_t 
     return (shm_block_hdr_t *)(shm_heap_base(r) + poff - sizeof(shm_block_hdr_t));
 }
 
+/**
+ * Bounds-checked heap-payload-offset (poff) → block header pointer.
+ *
+ * shm_blk_of_poff() is raw pointer arithmetic: a stale, corrupted, or simply
+ * out-of-range poff (including the SHM_OFF_NULL sentinel) turns straight into
+ * a pointer that can land outside [heap_base, heap_base + heap_size) and get
+ * dereferenced immediately by the caller (check_block_access() reads
+ * b->magic unconditionally).  Use this checked variant anywhere poff comes
+ * from a directory entry or an external caller rather than from block
+ * arithmetic the allocator just performed on a block it already validated.
+ *
+ * @return Pointer to the block header on success; NULL if poff is out of
+ *         range, or the block's own total_size claims to extend past the
+ *         end of the heap (a corrupted header).
+ */
+static inline shm_block_hdr_t *shm_blk_of_poff_checked(const shm_region_t *r, shm_off_t poff)
+{
+    if (poff == SHM_OFF_NULL || poff < sizeof(shm_block_hdr_t))
+        return NULL;
+
+    size_t hsz  = shm_heap_size(r);
+    size_t hoff = (size_t)poff - sizeof(shm_block_hdr_t);
+
+    if (hoff >= hsz || hoff + sizeof(shm_block_hdr_t) > hsz)
+        return NULL;
+
+    shm_block_hdr_t *b = shm_blk_at_hoff(r, hoff);
+
+    if (b->magic == SHM_ALLOC_MAGIC_BLOCK && hoff + b->total_size > hsz)
+        return NULL;                       /* corrupted header: refuse it */
+
+    return b;
+}
+
 /** Block header pointer → heap-header-offset. */
 static inline size_t shm_hoff_of_blk(const shm_region_t *r, const shm_block_hdr_t *b)
 {

@@ -315,7 +315,15 @@ static shm_obj_entry_t *dir_find_by_name(const shm_region_t *r, const char *name
 static shm_obj_entry_t *dir_find_free_slot(const shm_region_t *r)
 {
     shm_region_hdr_t *rh = shm_rh((shm_region_t *)r);
-    for (uint32_t i = 0; i < rh->dir_capacity; i++) {
+    /*
+     * next_id advances after every allocation, so starting at its
+     * corresponding slot makes append-only object creation O(1).  Continue
+     * cyclically to retain the original behavior when freed slots are reused.
+     */
+    const uint32_t start =
+        (uint32_t)((rh->next_id - 1u) % rh->dir_capacity);
+    for (uint32_t scanned = 0; scanned < rh->dir_capacity; scanned++) {
+        const uint32_t i = (start + scanned) % rh->dir_capacity;
         shm_obj_entry_t *e = shm_dir_slot(r, i);
         if (e->id == 0 || !e->alive)
             return e;
@@ -678,7 +686,11 @@ int shm_free(shm_region_t *region,
         return acc;
     }
 
-    shm_block_hdr_t *b = shm_blk_of_poff(region, slot->off);
+    shm_block_hdr_t *b = shm_blk_of_poff_checked(region, slot->off);
+    if (!b) {
+        region_unlock(region);
+        return EFAULT;    /* directory entry points outside the heap */
+    }
     heap_free_block(region, b);        /* clears allocated (tag bit), links, persists */
 
     memset(slot, 0, sizeof(*slot));    /* clear directory entry */
@@ -715,7 +727,11 @@ int shm_resize(shm_region_t *region,
         return acc;
     }
 
-    shm_block_hdr_t *b = shm_blk_of_poff(region, slot->off);
+    shm_block_hdr_t *b = shm_blk_of_poff_checked(region, slot->off);
+    if (!b) {
+        region_unlock(region);
+        return EFAULT;    /* directory entry points outside the heap */
+    }
     size_t new_total = shm_align_up(sizeof(shm_block_hdr_t) + new_size, HEAP_ALIGN);
 
     if (new_total <= b->total_size) {
@@ -925,6 +941,49 @@ int shm_dir_next(const shm_region_t *region,
     return ENOENT;
 }
 
+int shm_dir_read_slot(const shm_region_t *region,
+                      uint32_t            slot_index,
+                      shm_dir_read_mode_t mode,
+                      shm_dir_entry_t    *out)
+{
+    if (!region || !out ||
+        (mode != SHM_DIR_READ_LOCKED &&
+         mode != SHM_DIR_READ_LOCK_FREE))
+        return EINVAL;
+
+    shm_region_t *mutable_region = (shm_region_t *)region;
+    if (mode == SHM_DIR_READ_LOCKED) {
+        int rc = region_lock(mutable_region);
+        if (rc != 0)
+            return rc;
+    }
+
+    shm_region_hdr_t *rh = shm_rh(mutable_region);
+    int result = 0;
+    if (slot_index >= rh->dir_capacity) {
+        result = ERANGE;
+    } else {
+        shm_obj_entry_t *e = shm_dir_slot(region, slot_index);
+        if (!e->alive || e->id == 0) {
+            result = ENOENT;
+        } else {
+            out->id        = e->id;
+            out->off       = e->off;
+            out->capacity  = e->capacity;
+            out->used_size = e->used_size;
+            out->type_tag  = e->type_tag;
+            out->owner     = e->owner;
+            out->perms     = e->perms;
+            strncpy(out->name, e->name, DIR_NAME_MAX - 1);
+            out->name[DIR_NAME_MAX - 1] = '\0';
+        }
+    }
+
+    if (mode == SHM_DIR_READ_LOCKED)
+        region_unlock(mutable_region);
+    return result;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Public API: direct pointer access
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -937,7 +996,7 @@ void *shm_ptr(const shm_region_t *region,
 {
     if (!region) return NULL;
 
-    shm_block_hdr_t *b = shm_blk_of_poff(region, off);
+    shm_block_hdr_t *b = shm_blk_of_poff_checked(region, off);
 
     if (check_block_access(b, user_id, caller_perms, required_perms) != 0)
         return NULL;
@@ -955,7 +1014,7 @@ int shm_block_info(const shm_region_t *region,
 {
     if (!region) return EINVAL;
 
-    shm_block_hdr_t *b = shm_blk_of_poff(region, off);
+    shm_block_hdr_t *b = shm_blk_of_poff_checked(region, off);
 
     if (!b || b->magic != SHM_ALLOC_MAGIC_BLOCK)
         return EINVAL;
@@ -979,7 +1038,7 @@ int shm_block_set_perms(shm_region_t *region,
 
     region_lock(region);
 
-    shm_block_hdr_t *b = shm_blk_of_poff(region, off);
+    shm_block_hdr_t *b = shm_blk_of_poff_checked(region, off);
 
     int acc = check_block_access(b, user_id, caller_perms, SHM_PERM_WRITE);
     if (acc != 0) {

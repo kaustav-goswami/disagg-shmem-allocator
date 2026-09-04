@@ -267,7 +267,9 @@ int shm_alloc(shm_region_t  *region,
  * @param obj_id        Monotonic ID returned by shm_alloc().
  * @param user_id       Caller's user id.
  * @param caller_perms  Must contain SHM_PERM_FREE (or SHM_PERM_ADMIN).
- * @return              0, ENOENT (id not found), EACCES (permission denied).
+ * @return              0, ENOENT (id not found), EACCES (permission denied),
+ *                      EFAULT (directory entry's stored offset does not
+ *                      resolve to a valid block inside the heap).
  */
 int shm_free(shm_region_t *region,
              uint64_t      obj_id,
@@ -297,7 +299,9 @@ int shm_free(shm_region_t *region,
  * @param new_size      New logical (and physical) size in bytes.
  * @param user_id       Caller's user id.
  * @param caller_perms  Must contain SHM_PERM_RESIZE (or SHM_PERM_ADMIN).
- * @return              0, ENOENT, EACCES, or ENOMEM (heap exhausted on grow).
+ * @return              0, ENOENT, EACCES, ENOMEM (heap exhausted on grow), or
+ *                      EFAULT (directory entry's stored offset does not
+ *                      resolve to a valid block inside the heap).
  */
 int shm_resize(shm_region_t *region,
                uint64_t      obj_id,
@@ -374,6 +378,42 @@ int shm_dir_next(const shm_region_t *region,
                  uint32_t           *cursor,
                  shm_dir_entry_t    *out);
 
+/**
+ * Select how shm_dir_read_slot() synchronises a directory-entry read.
+ *
+ * LOCKED serialises the copy with allocation, free, resize, and permission
+ * changes. LOCK_FREE performs no locking and is intended for parallel readers
+ * after all directory mutations have stopped.
+ */
+typedef enum shm_dir_read_mode {
+    SHM_DIR_READ_LOCKED    = 0,
+    SHM_DIR_READ_LOCK_FREE = 1,
+} shm_dir_read_mode_t;
+
+/**
+ * @brief Read one physical directory slot.
+ *
+ * This slot-oriented API allows callers to partition [0, dir_capacity) among
+ * worker threads without sharing a cursor, so a fleet of readers can load
+ * object metadata in parallel instead of racing a single shm_dir_next()
+ * cursor. Use shm_pool_stats() to obtain dir_capacity.
+ *
+ * SHM_DIR_READ_LOCK_FREE is lock-free only under a quiescent-directory
+ * contract: no process may allocate, free, resize, or change permissions
+ * until all lock-free readers finish. Violating this contract is undefined.
+ *
+ * @param region      Region handle.
+ * @param slot_index  Physical directory slot in [0, dir_capacity).
+ * @param mode         SHM_DIR_READ_LOCKED or SHM_DIR_READ_LOCK_FREE.
+ * @param out          Receives a copy of the directory entry on success.
+ * @return             0, ENOENT for an unused slot, ERANGE for an invalid
+ *                      slot index, or EINVAL for invalid arguments/mode.
+ */
+int shm_dir_read_slot(const shm_region_t *region,
+                      uint32_t            slot_index,
+                      shm_dir_read_mode_t mode,
+                      shm_dir_entry_t    *out);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Direct pointer access
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -381,8 +421,11 @@ int shm_dir_next(const shm_region_t *region,
 /**
  * @brief Resolve a heap-relative offset to a local virtual pointer.
  *
- * Validates the block magic, checks ownership (unless ADMIN), and verifies
+ * Validates that off resolves to a block fully inside the mapped heap,
+ * checks the block magic, checks ownership (unless ADMIN), and verifies
  * that the block's stored permission bits include all bits in required_perms.
+ * A stale, corrupted, or otherwise out-of-range off returns NULL rather than
+ * dereferencing memory outside the mapping.
  *
  * @param region          Region handle.
  * @param off             Heap-relative payload offset.

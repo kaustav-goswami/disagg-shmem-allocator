@@ -44,7 +44,7 @@ LIB_OBJS_CAP = $(LIB_OBJS) $(BUILD)/shm_cap.o
 
 # ── Test binaries ────────────────────────────────────────────────────────────
 TESTS = $(BUILD)/test_basic $(BUILD)/test_resize $(BUILD)/test_multihost \
-        $(BUILD)/test_cap
+        $(BUILD)/test_cap $(BUILD)/test_bounds
 
 .PHONY: all test clean
 
@@ -82,6 +82,11 @@ $(BUILD)/test_multihost: tests/test_multihost.c $(LIB_OBJS) | $(BUILD)
 $(BUILD)/test_cap: tests/test_cap.c $(LIB_OBJS_CAP) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_cap.c $(LIB_OBJS_CAP) $(LDFLAGS)
 
+# test_bounds exercises the bounds-checked offset->block-header conversion
+# and reaches into src/shm_internal.h to corrupt offsets/headers directly.
+$(BUILD)/test_bounds: tests/test_bounds.c src/shm_internal.h $(LIB_OBJS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/test_bounds.c $(LIB_OBJS) $(LDFLAGS)
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 test: all
 	@echo "─── test_basic ──────────────────"
@@ -92,6 +97,8 @@ test: all
 	./$(BUILD)/test_multihost
 	@echo "─── test_cap ────────────────────"
 	./$(BUILD)/test_cap
+	@echo "─── test_bounds ─────────────────"
+	./$(BUILD)/test_bounds
 
 # ── Remove build artifacts ────────────────────────────────────────────────────
 clean:
@@ -108,3 +115,7 @@ clean:
 	-rm -f /dev/shm/shm_test_multihost
 	-rm -f /dev/shm/shm_test_ns_enforce
 	-rm -f /dev/shm/test_cap_region
+	-rm -f /dev/shm/shm_test_parallel_dir
+	-rm -f /dev/shm/shm_test_bounds_read
+	-rm -f /dev/shm/shm_test_bounds_corrupt
+	-rm -f /dev/shm/shm_test_bounds_dir

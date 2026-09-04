@@ -159,11 +159,25 @@ static void test_alloc_and_lookup(void)
     rc = shm_dir_next(r, &cursor, &entry);
     CHECK_ERR(rc, ENOENT, "shm_dir_next returns ENOENT after last entry");
 
+    /* Slot-oriented reads (parallel-lookup API) see the same entry. */
+    rc = shm_dir_read_slot(r, 0, SHM_DIR_READ_LOCKED, &entry);
+    CHECK_OK(rc, "locked slot read finds first entry");
+    CHECK(entry.id == id, "locked slot read returns correct entry");
+    rc = shm_dir_read_slot(r, 0, SHM_DIR_READ_LOCK_FREE, &entry);
+    CHECK_OK(rc, "lock-free slot read finds first entry");
+    CHECK(entry.id == id, "lock-free slot read returns correct entry");
+
     /* Stats: one live block. */
     shm_pool_stats_t st;
     shm_pool_stats(r, &st);
     CHECK(st.block_count == 1, "pool has one live block");
     CHECK(st.dir_used    == 1, "directory has one live entry");
+    rc = shm_dir_read_slot(r, st.dir_capacity, SHM_DIR_READ_LOCKED, &entry);
+    CHECK_ERR(rc, ERANGE, "slot read rejects out-of-range index");
+    rc = shm_dir_read_slot(r, 0, SHM_DIR_READ_LOCKED, NULL);
+    CHECK_ERR(rc, EINVAL, "slot read rejects NULL out param");
+    rc = shm_dir_read_slot(r, 0, (shm_dir_read_mode_t)99, &entry);
+    CHECK_ERR(rc, EINVAL, "slot read rejects unknown mode");
 
     /* Free the object. */
     rc = shm_free_id(r, id, uid, perms);
@@ -176,6 +190,67 @@ static void test_alloc_and_lookup(void)
     /* Lookup after free must return ENOENT. */
     rc = shm_lookup(r, id, uid, SHM_PERM_READ, NULL, NULL);
     CHECK_ERR(rc, ENOENT, "lookup after free returns ENOENT");
+    rc = shm_dir_read_slot(r, 0, SHM_DIR_READ_LOCK_FREE, &entry);
+    CHECK_ERR(rc, ENOENT, "lock-free slot read sees freed slot as empty");
+
+    shm_region_close(r, true);
+}
+
+static void test_parallel_dir_reads(void)
+{
+    puts("\n[test_parallel_dir_reads]");
+
+    shm_region_t *r = NULL;
+    shm_region_open_opts_t opts = {
+        .backend = SHM_BACKEND_POSIX, .flags = SHM_OPEN_CREATE,
+        .dir_capacity = 32,
+    };
+    shm_region_open("/shm_test_parallel_dir", 1 << 20, &opts, &r);
+
+    const shm_user_id_t uid = 7;
+
+    /* Allocate enough objects to make next_id wrap the directory capacity
+     * more than once, exercising the scan-near-next_id optimization in
+     * dir_find_free_slot() together with slot reuse after frees. */
+    uint64_t  ids[20];
+    shm_off_t off;
+    for (int i = 0; i < 20; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "pobj_%d", i);
+        int rc = shm_alloc_typed(r, record_t, name, uid, SHM_PERM_DEFAULT,
+                                 &ids[i], &off);
+        CHECK_OK(rc, "alloc object for parallel-read test");
+        if (i % 3 == 0)
+            shm_free(r, ids[i], uid, SHM_PERM_DEFAULT);  /* churn some slots */
+    }
+
+    shm_pool_stats_t st;
+    shm_pool_stats(r, &st);
+
+    /* Partition [0, dir_capacity) among two "workers" with disjoint slot
+     * ranges and confirm every live object is discovered exactly once,
+     * matching what shm_dir_next() would produce serially. */
+    uint32_t seen_via_slots = 0;
+    for (uint32_t worker = 0; worker < 2; worker++) {
+        for (uint32_t s = worker; s < st.dir_capacity; s += 2) {
+            shm_dir_entry_t e;
+            int rc = shm_dir_read_slot(r, s, SHM_DIR_READ_LOCK_FREE, &e);
+            if (rc == 0)
+                seen_via_slots++;
+            else
+                CHECK(rc == ENOENT, "unused slot reads as ENOENT");
+        }
+    }
+    CHECK(seen_via_slots == st.dir_used,
+          "partitioned lock-free slot scan finds every live entry exactly once");
+
+    uint32_t seen_via_cursor = 0;
+    uint32_t cursor = 0;
+    shm_dir_entry_t e;
+    while (shm_dir_next(r, &cursor, &e) == 0)
+        seen_via_cursor++;
+    CHECK(seen_via_cursor == seen_via_slots,
+          "slot-partitioned scan agrees with serial shm_dir_next count");
 
     shm_region_close(r, true);
 }
@@ -294,6 +369,7 @@ int main(void)
     test_alloc_and_lookup();
     test_permissions();
     test_multiple_objects();
+    test_parallel_dir_reads();
 
     if (g_failed) {
         fprintf(stderr, "\nSome tests FAILED.\n");

@@ -7,6 +7,11 @@ A C11 / C++17 allocator for **POSIX shared memory** and **DAX / CXL disaggregate
 - **Dynamic resize** (grow in-place or with relocation; shrink)
 - **User-id ownership** and per-object **permission bits**
 - **Namespace / cgroup protection** against cross-boundary access
+- **Bounds-checked pointer resolution** — a stale, corrupted, or out-of-range
+  offset fails cleanly (`NULL` / `EINVAL` / `EFAULT`) instead of dereferencing
+  memory outside the mapped region
+- **Parallel directory lookups** — `shm_dir_read_slot()` lets worker threads
+  partition the object directory and load metadata concurrently
 - C++ typed wrappers with placement new, `static_cast`, and `dynamic_cast`
 
 Parts of this program is vibe coded.
@@ -206,6 +211,48 @@ while (shm_dir_next(region, &cursor, &entry) == 0) {
 
 ---
 
+## Parallel directory lookups
+
+`shm_dir_next()` iterates the directory through a single shared cursor, so
+concurrent readers either serialize on it or race each other. `shm_dir_read_slot()`
+gives worker threads direct access to a physical slot index, so a fleet of
+readers can partition `[0, dir_capacity)` and load object metadata in
+parallel with no shared state:
+
+```c
+shm_pool_stats_t st;
+shm_pool_stats(region, &st);
+
+// Worker `w` of `n_workers` scans every n_workers-th slot.
+for (uint32_t i = worker_id; i < st.dir_capacity; i += n_workers) {
+    shm_dir_entry_t e;
+    int rc = shm_dir_read_slot(region, i, SHM_DIR_READ_LOCK_FREE, &e);
+    if (rc == 0) {
+        // e.id, e.off, e.name, ... — same fields as shm_dir_next()
+    } else if (rc == ENOENT) {
+        continue;   // slot is unused or was freed
+    }
+}
+```
+
+`shm_dir_read_mode_t` selects how the read is synchronized:
+
+| Mode                     | Behavior |
+|--------------------------|----------|
+| `SHM_DIR_READ_LOCKED`    | Takes the region mutex; serializes with `shm_alloc`/`shm_free`/`shm_resize`/`shm_block_set_perms`. Safe at any time. |
+| `SHM_DIR_READ_LOCK_FREE` | No locking. Only safe under a **quiescent-directory contract**: no process may allocate, free, resize, or change permissions while any lock-free reader is running. Violating this is undefined behavior — use it for read-mostly / snapshot-style workloads (e.g. a scan phase between mutation phases), not concurrently with live writers. |
+
+`shm_dir_read_slot()` returns `0` with `*out` filled, `ENOENT` for an unused
+or freed slot, `ERANGE` if `slot_index >= dir_capacity`, or `EINVAL` for a
+NULL region/out pointer or an unrecognized mode.
+
+As a companion optimization, `shm_alloc()`'s free-slot scan now starts at the
+slot corresponding to `next_id` instead of always scanning from slot 0, making
+append-only allocation patterns (the common case) O(1) instead of O(directory
+size); it still scans cyclically so freed slots are still reused.
+
+---
+
 ## Build
 
 ```bash
@@ -346,6 +393,42 @@ shm_region_open("/my_pool", 0, &opts, &region);
 | 0x80 | `SHM_PERM_ADMIN`  | bypass owner-id check |
 
 Both the **block's stored perms** and the **caller's perms** must contain the required bits.
+
+---
+
+## Bounds-checked offset resolution
+
+Every `shm_off_t` that reaches a data-plane function is either supplied
+directly by a caller (`shm_ptr`, `shm_block_info`, `shm_block_set_perms`) or
+read back out of a directory entry (`shm_free`, `shm_resize`). In either case
+the value can be stale, corrupted (e.g. a torn write from another host), or
+simply wrong. Converting such an offset into a block-header pointer with raw
+arithmetic — `heap_base + off - sizeof(header)` — can land outside
+`[heap_base, heap_base + heap_size)` and get dereferenced immediately,
+turning a bad offset into a crash or an out-of-bounds read/write instead of a
+clean error.
+
+All five of these functions now resolve `off` through a single bounds-checked
+choke point before touching the block header. It rejects the offset if:
+
+1. it is the `SHM_OFF_NULL` sentinel, or too small to have a header before it,
+2. the header itself would not fit entirely inside the mapped heap, or
+3. the header's own `total_size` claims to extend past the end of the heap
+   (a corrupted-but-in-range header).
+
+| Function                  | Behavior on an invalid offset (unchanged call signature) |
+|----------------------------|-----------------------------------------------------------|
+| `shm_ptr()`                | Returns `NULL` (same as any other access-check failure) |
+| `shm_block_info()`         | Returns `EINVAL` |
+| `shm_block_set_perms()`    | Returns `EINVAL` |
+| `shm_free()`               | Returns `EFAULT` (directory entry points outside the heap) |
+| `shm_resize()`             | Returns `EFAULT` (directory entry points outside the heap) |
+
+No public API signatures changed — existing callers that already check the
+return value / NULL correctly require no changes. `tests/test_bounds.c`
+covers the null sentinel, zero, just-past-heap-end, wildly out-of-range
+offsets, a header whose `total_size` overruns the heap, and directory entries
+corrupted to point outside the heap for both `shm_free()` and `shm_resize()`.
 
 ---
 
@@ -737,9 +820,12 @@ src/
   shm_ns.h         Internal: IPC namespace + cgroup fingerprint declarations
   shm_ns.c         Internal: /proc/self/ns/ipc inode + FNV-1a cgroup hash
 tests/
-  test_basic.c     open/close, alloc, lookup, permissions, multi-object
+  test_basic.c     open/close, alloc, lookup, permissions, multi-object,
+                   parallel slot-partitioned directory reads
   test_resize.c    shrink, in-place grow, relocation grow, permission check
   test_multihost.c fork-based multi-process discovery, NS enforcement
   test_cap.c       capability derive, deref, tag bit, ABA, narrowing, forgery
+  test_bounds.c    bounds-checked offset resolution: bad offsets, corrupted
+                   headers, corrupted directory entries (EFAULT/EINVAL/NULL)
 Makefile
 ```
