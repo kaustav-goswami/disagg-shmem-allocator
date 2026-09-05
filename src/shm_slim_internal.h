@@ -1,0 +1,215 @@
+/**
+ * @file  shm_slim_internal.h
+ * @brief Internal on-disk layout + inline helpers for the v0.2 "slim" format.
+ *
+ * Not part of the public API; include shm_slim.h from user code instead.
+ * Deliberately independent of shm_internal.h (the v2 layout) -- nothing in
+ * this file is shared with, or compatible with, the v2 format.
+ */
+
+#ifndef SHM_SLIM_INTERNAL_H
+#define SHM_SLIM_INTERNAL_H
+
+#define _POSIX_C_SOURCE 200809L   /* robust mutexes, shm_open */
+
+#include "shm_slim.h"
+#include "shm_persist.h"   /* shm_persist(), shm_drain(), shm_flush_line() */
+
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+/* ── Internal constants ──────────────────────────────────────────────────── */
+
+/** Every heap block and the region header are rounded to this alignment. */
+#define SHM_SLIM_ALIGN  8u
+
+/**
+ * Minimum physical block size: header + one alignment quantum of payload.
+ * The extra 8 bytes beyond the header are not optional padding -- they are
+ * where a *freed* block's free-list link lives (see shm_slim_set_free_link
+ * below), so every block, however small the requested payload, must have
+ * room for it once freed.
+ */
+#define SHM_SLIM_BLOCK_MIN  (sizeof(shm_slim_hdr_t) + SHM_SLIM_ALIGN)
+
+/* ── In-memory struct definitions ───────────────────────────────────────── */
+
+/**
+ * Per-object heap block header. Exactly 16 bytes, always immediately
+ * preceding the payload -- see shm_slim.h for the full design rationale.
+ */
+typedef struct shm_slim_hdr {
+    uint32_t magic;   /* SHM_SLIM_MAGIC_LIVE / _LIVE_NAMED / _FREE */
+    uint32_t key;     /* shm_slim_key_t; access-control token, 0 = open */
+    uint64_t size;    /* total block size (header + payload), aligned */
+} shm_slim_hdr_t;
+
+/* The whole point of this format: a live object's fixed overhead must not
+ * exceed a typical malloc chunk header. */
+_Static_assert(sizeof(shm_slim_hdr_t) == 16,
+               "shm_slim_hdr_t must be exactly 16 bytes");
+
+/**
+ * Region header -- lives at base[0]. O(1) per region, not per object, so it
+ * is not under the same pressure to be minimal as the block header is.
+ */
+typedef struct shm_slim_region_hdr {
+    uint32_t        magic;         /* SHM_SLIM_MAGIC_REGION ("SHMA") */
+    uint32_t        version;       /* SHM_SLIM_VERSION ("slim") */
+    uint32_t        backend;       /* shm_slim_backend_t cast to uint32 */
+    uint32_t        name_cap;      /* capacity of the name table */
+    pthread_mutex_t mutex;         /* process-shared robust mutex */
+    uint32_t        host_count;    /* attached processes */
+    uint32_t        _pad0;
+    size_t          region_size;   /* total mapping size in bytes */
+    size_t          name_offset;   /* byte offset of the name table */
+    size_t          data_offset;   /* byte offset of the heap */
+    uint64_t        free_list;     /* 1-based hoff -> first free block */
+    size_t          used_bytes;    /* bytes committed to live blocks */
+    size_t          block_count;   /* live block count */
+    uint64_t        ns_inode;      /* IPC namespace inode of creator */
+    uint64_t        cgroup_hash;   /* FNV-1a hash of creator's cgroup */
+    char            shm_name[64];  /* the name/path used at creation */
+} shm_slim_region_hdr_t;
+
+/**
+ * Name table entry -- one per named object. Sized to how many objects the
+ * application actually wants to name, not to the total object count.
+ */
+typedef struct shm_slim_name_entry {
+    char      name[SHM_SLIM_NAME_MAX];  /* NUL-padded; name[0]==0 -> empty */
+    shm_off_t off;                       /* payload offset of the object */
+} shm_slim_name_entry_t;
+
+/** Per-process region handle. Not visible to other host processes. */
+struct shm_slim_region {
+    char                *name;     /* heap copy of the shm name / dax path */
+    int                  fd;       /* file descriptor */
+    void                *base;     /* mmap base pointer */
+    size_t               size;     /* total mapping length in bytes */
+    bool                 creator;  /* true if this process created the region */
+    shm_slim_backend_t   backend;
+};
+
+/* ── Inline accessor helpers ─────────────────────────────────────────────── */
+
+static inline size_t shm_slim_align_up(size_t n, size_t a)
+{
+    return (n + a - 1u) & ~(a - 1u);
+}
+
+static inline shm_slim_region_hdr_t *shm_slim_rh(const shm_slim_region_t *r)
+{
+    return (shm_slim_region_hdr_t *)r->base;
+}
+
+static inline shm_slim_name_entry_t *shm_slim_name_base(const shm_slim_region_t *r)
+{
+    return (shm_slim_name_entry_t *)((char *)r->base + shm_slim_rh(r)->name_offset);
+}
+
+static inline shm_slim_name_entry_t *shm_slim_name_slot(const shm_slim_region_t *r, uint32_t idx)
+{
+    return &shm_slim_name_base(r)[idx];
+}
+
+static inline char *shm_slim_heap_base(const shm_slim_region_t *r)
+{
+    return (char *)r->base + shm_slim_rh(r)->data_offset;
+}
+
+static inline size_t shm_slim_heap_size(const shm_slim_region_t *r)
+{
+    return r->size - shm_slim_rh(r)->data_offset;
+}
+
+/** Heap-header-offset (hoff) -> block header pointer. Unchecked. */
+static inline shm_slim_hdr_t *shm_slim_blk_at_hoff(const shm_slim_region_t *r, size_t hoff)
+{
+    return (shm_slim_hdr_t *)(shm_slim_heap_base(r) + hoff);
+}
+
+/** Block header pointer -> heap-header-offset. */
+static inline size_t shm_slim_hoff_of_blk(const shm_slim_region_t *r, const shm_slim_hdr_t *b)
+{
+    return (size_t)((const char *)b - shm_slim_heap_base(r));
+}
+
+/** Block header pointer -> heap-payload-offset (what callers store as shm_off_t). */
+static inline shm_off_t shm_slim_poff_of_blk(const shm_slim_region_t *r, const shm_slim_hdr_t *b)
+{
+    return (shm_off_t)(shm_slim_hoff_of_blk(r, b) + sizeof(shm_slim_hdr_t));
+}
+
+/** Heap-payload-offset (poff) -> block header pointer. Unchecked. */
+static inline shm_slim_hdr_t *shm_slim_blk_of_poff(const shm_slim_region_t *r, shm_off_t poff)
+{
+    return (shm_slim_hdr_t *)(shm_slim_heap_base(r) + poff - sizeof(shm_slim_hdr_t));
+}
+
+/**
+ * Bounds-checked heap-payload-offset (poff) -> block header pointer.
+ *
+ * Carried forward from the v2 fix: a stale, corrupted, or out-of-range poff
+ * must never turn into a pointer that lands outside
+ * [heap_base, heap_base + heap_size) and gets dereferenced immediately.
+ *
+ * @return Pointer to the block header on success; NULL if poff is out of
+ *         range, or the block's own `size` claims to extend past the end
+ *         of the heap (a corrupted header).
+ */
+static inline shm_slim_hdr_t *shm_slim_blk_of_poff_checked(const shm_slim_region_t *r, shm_off_t poff)
+{
+    if (poff == SHM_OFF_NULL || poff < sizeof(shm_slim_hdr_t))
+        return NULL;
+
+    size_t hsz  = shm_slim_heap_size(r);
+    size_t hoff = (size_t)poff - sizeof(shm_slim_hdr_t);
+
+    if (hoff >= hsz || hoff + sizeof(shm_slim_hdr_t) > hsz)
+        return NULL;
+
+    shm_slim_hdr_t *b = shm_slim_blk_at_hoff(r, hoff);
+
+    if ((b->magic == SHM_SLIM_MAGIC_LIVE ||
+         b->magic == SHM_SLIM_MAGIC_LIVE_NAMED ||
+         b->magic == SHM_SLIM_MAGIC_FREE) &&
+        hoff + b->size > hsz)
+        return NULL;   /* corrupted header: refuse it */
+
+    return b;
+}
+
+/** Encode a heap-header-offset as a 1-based free-list link (0 = end of list). */
+static inline uint64_t shm_slim_link_enc(size_t hoff) { return (uint64_t)hoff + 1u; }
+
+/** Decode a free-list link back to its heap-header-offset. */
+static inline size_t shm_slim_link_dec(uint64_t lnk) { return (size_t)(lnk - 1u); }
+
+/** Dereference a free-list link; returns NULL when lnk == 0. */
+static inline shm_slim_hdr_t *shm_slim_blk_of_link(const shm_slim_region_t *r, uint64_t lnk)
+{
+    return lnk ? shm_slim_blk_at_hoff(r, shm_slim_link_dec(lnk)) : NULL;
+}
+
+/**
+ * Free-list link storage for a FREE block. Overlaid on the block's own
+ * payload area (the first 8 bytes right after the header) rather than kept
+ * as a header field -- this is why a live block costs nothing for it, and
+ * why SHM_SLIM_BLOCK_MIN reserves 8 extra bytes beyond the header.
+ */
+static inline void shm_slim_set_free_link(shm_slim_hdr_t *b, uint64_t link)
+{
+    memcpy((char *)b + sizeof(*b), &link, sizeof(link));
+}
+
+static inline uint64_t shm_slim_get_free_link(const shm_slim_hdr_t *b)
+{
+    uint64_t link;
+    memcpy(&link, (const char *)b + sizeof(*b), sizeof(link));
+    return link;
+}
+
+#endif /* SHM_SLIM_INTERNAL_H */

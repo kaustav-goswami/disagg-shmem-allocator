@@ -22,6 +22,7 @@
 
 #include "shm_internal.h"   /* shared structs, inline helpers */
 #include "shm_ns.h"         /* namespace / cgroup fingerprinting */
+#include "shm_generic_backend.h"  /* optional jemalloc/tcmalloc/cxlalloc/ralloc backend */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -454,6 +455,35 @@ int shm_region_open(const char                   *name_or_path,
     reg->creator = creating;
     reg->fd      = -1;
 
+    if (backend == SHM_BACKEND_GENERIC) {
+        /* A generic-allocator backend has no OS-level named object for a
+         * second process to attach to -- see shm_generic_backend.h. */
+        if (!creating) {
+            free(reg->name); free(reg);
+            return ENOTSUP;
+        }
+        if (size < 4096) {
+            free(reg->name); free(reg);
+            return EINVAL;
+        }
+        reg->base = shm_generic_backend_alloc(size);
+        if (!reg->base) {
+            free(reg->name); free(reg);
+            return ENOMEM;
+        }
+        reg->size = size;
+        region_init(reg, size, backend, dir_cap, name_or_path);
+
+        region_lock(reg);
+        shm_rh(reg)->host_count++;
+        shm_persist(&shm_rh(reg)->host_count, sizeof(shm_rh(reg)->host_count));
+        shm_drain();
+        region_unlock(reg);
+
+        *out_region = reg;
+        return 0;
+    }
+
     /* Open the backing file descriptor. */
     if (backend == SHM_BACKEND_POSIX) {
         int oflags = creating ? (O_CREAT | O_RDWR) : O_RDWR;
@@ -564,7 +594,10 @@ void shm_region_close(shm_region_t *region, bool unlink_name)
             shm_drain();
         }
         region_unlock(region);
-        munmap(region->base, region->size);
+        if (region->backend == SHM_BACKEND_GENERIC)
+            shm_generic_backend_free(region->base, region->size);
+        else
+            munmap(region->base, region->size);
     }
     if (region->fd >= 0)
         close(region->fd);

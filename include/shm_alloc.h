@@ -114,8 +114,17 @@ typedef uint32_t shm_user_id_t;
 
 /** Selects the underlying memory technology used to back the region. */
 typedef enum shm_backend {
-    SHM_BACKEND_POSIX = 0,  /* POSIX shm_open IPC shared memory        */
-    SHM_BACKEND_DAX   = 1,  /* /dev/daxX.Y disaggregated / CXL memory  */
+    SHM_BACKEND_POSIX   = 0,  /* POSIX shm_open IPC shared memory        */
+    SHM_BACKEND_DAX     = 1,  /* /dev/daxX.Y disaggregated / CXL memory  */
+    /**
+     * Source the region's backing memory from a vendored allocator library
+     * (jemalloc / tcmalloc / cxlalloc / ralloc) selected at compile time --
+     * see src/shm_generic_backend.h and the "Generic allocator backend"
+     * section of README.md. `size` must be >= 4096; SHM_OPEN_CREATE must
+     * be set (there is no OS-level named object for a second process to
+     * attach to, so opening without create returns ENOTSUP).
+     */
+    SHM_BACKEND_GENERIC = 2,
 } shm_backend_t;
 
 /* ── Open flags ──────────────────────────────────────────────────────────── */

@@ -12,13 +12,43 @@ A C11 / C++17 allocator for **POSIX shared memory** and **DAX / CXL disaggregate
   memory outside the mapped region
 - **Parallel directory lookups** — `shm_dir_read_slot()` lets worker threads
   partition the object directory and load metadata concurrently
+- **Pluggable memory backend** — source a region from POSIX shm, a DAX
+  device, or a vendored allocator (jemalloc / tcmalloc / cxlalloc / ralloc),
+  selected at compile time
 - C++ typed wrappers with placement new, `static_cast`, and `dynamic_cast`
+- A **v0.2 "slim" format** with 16 bytes of metadata per object instead of
+  152 — API-compatible with the above by swapping one `#include`
 
 Parts of this program is vibe coded.
 
 ---
 
+## Two formats: v2 and v0.2 "slim"
+
+This repository now ships **two independent, mutually incompatible formats**:
+
+- **v2** (everything below, through [File structure](#file-structure)) — the
+  original, full-featured format: object directory, monotonic IDs, owner +
+  permission bitmask, type tags, the CHERI-like capability layer, C++ typed
+  wrappers. 152 bytes of metadata per object (56-byte block header + 96-byte
+  directory entry).
+- **[v0.2 "slim"](#v02--the-slim-format)** — a from-scratch, much smaller
+  format built for the same disaggregated-memory use case at much larger
+  object counts. 16 bytes of metadata per anonymous object. See that section
+  for the full design and [WIP.md](WIP.md) for the rationale and every
+  decision made along the way.
+
+They are separate modules (`shm_alloc.*` / `shm_cap.*` vs. `shm_slim.*`) that
+can be built and used independently, or together in the same program (no
+symbol or type collisions). Neither can open a region created by the other —
+see [Incompatibility with v2](#incompatibility-with-v2) for how that's
+enforced.
+
+---
+
 ## Memory layout
+
+*(v2 format. For the slim format, jump to [v0.2 "slim"](#v02--the-slim-format).)*
 
 The mapping is split into three contiguous zones.  `dir_offset` and
 `data_offset` are written into the region header at creation time, so a new
@@ -184,6 +214,51 @@ caller supplies:  user_id  +  caller_perms  +  required_perms
 |---------|--------------|-------|
 | `SHM_BACKEND_POSIX` | default | `shm_open("/name")` + `mmap(MAP_SHARED)` |
 | `SHM_BACKEND_DAX`   | `opts.backend = SHM_BACKEND_DAX` | `open("/dev/dax0.0")` + `mmap(MAP_SHARED)`, no `ftruncate` |
+| `SHM_BACKEND_GENERIC` | `opts.backend = SHM_BACKEND_GENERIC` + a compile-time flag | sources the region from jemalloc / tcmalloc / cxlalloc / ralloc instead -- see below |
+
+---
+
+## Generic allocator backend
+
+A third backend lets you source a region's backing memory from a vendored
+allocator library instead of `shm_open`/DAX -- available identically on
+v2 (`SHM_BACKEND_GENERIC`) and [v0.2 slim](#v02--the-slim-format)
+(`SHM_SLIM_BACKEND_GENERIC`). Select exactly one library at compile time:
+
+```bash
+make GENERIC_ALLOC=jemalloc   # builds jemalloc/ (autoconf) and links it
+make GENERIC_ALLOC=cxlalloc   # builds cxlalloc/cxlalloc-static (cargo) and links it
+make GENERIC_ALLOC=tcmalloc   # wired, but you must build libtcmalloc yourself (needs Bazel)
+make GENERIC_ALLOC=ralloc     # wired, but not buildable with any available Rust toolchain
+```
+
+None of the vendored submodules (`jemalloc/`, `tcmalloc/`, `cxlalloc/`,
+`ralloc/`) are modified — this only calls each library's existing public
+API. `jemalloc` and `cxlalloc` are fully working (built and tested end to
+end as part of this change); `tcmalloc` and `ralloc` are wired with the
+correct real symbol names but fail the build with an explanatory message
+instead of silently doing nothing — see [WIP.md](WIP.md) for exactly what
+each one required (or didn't) to build, and a known caveat around using the
+cxlalloc backend for both v2 and slim in the same process.
+
+```c
+shm_region_open_opts_t opts = {
+    .backend = SHM_BACKEND_GENERIC,
+    .flags   = SHM_OPEN_CREATE,
+};
+shm_region_t *region;
+shm_region_open("my-pool", 1 << 20, &opts, &region);   // name is just a debug label here
+```
+
+**This is single-process only.** A generic-backend region is memory
+obtained from a library call (`malloc`-style) in the calling process's own
+address space, not a named OS object like a POSIX shm segment or DAX device
+that a second process can independently attach to. Opening a generic-backend
+region with `SHM_OPEN_CREATE` unset returns `ENOTSUP` — this is a real
+capability gap versus POSIX/DAX, not an unimplemented detail. (cxlalloc
+itself does support real cross-process sharing via its `heap_id` and
+`"shm"`/`"ivshmem"` heap-backend modes; this integration uses its `"mmap"`
+mode and doesn't yet take advantage of that — a natural follow-up.)
 
 ---
 
@@ -804,28 +879,280 @@ hardware.  An unsupported instruction will raise `SIGILL`.
 
 ---
 
+## v0.2 — the "slim" format
+
+### Why
+
+v2 spends 152 bytes of metadata per object (56-byte block header + 96-byte
+directory entry) whether that object is 8 bytes or 8 megabytes. At the scale
+this allocator targets — disaggregated memory holding huge numbers of small
+objects — that stops working: **300M objects representing 2.1 GiB of actual
+data need on the order of 40+ GiB of metadata under v2** (`300,000,000 × 152
+bytes ≈ 42.5 GiB`, using the real struct sizes above — over 20x the data
+itself). A typical `malloc` spends 8–16 bytes per chunk. v0.2 targets that
+ballpark for the common case: **16 bytes for an anonymous object, always.**
+
+Full design rationale, every dropped/kept feature and why, and the bug that
+testing caught along the way are in [WIP.md](WIP.md).
+
+### What's different, in one table
+
+| | v2 | v0.2 "slim" |
+|---|---|---|
+| Per-object fixed overhead | 152 B (56 B block header + 96 B directory entry) | 16 B (block header only) |
+| Object directory | Fixed array, one 96 B slot per object, sized to the max object count | Gone. Optional name table sized to how many objects you *name*, not how many you allocate (default 64 slots × 32 B = 2 KiB total, independent of object count) |
+| Object identity | Monotonic `uint64_t` ID *and* an offset handle | Offset handle only (the ID was always redundant with it) |
+| Access control | Owner `uint32_t` + 5-bit permission mask + admin bypass (2-party check, 5 steps) | One `uint32_t` key; match or don't (1 step) |
+| Type checking | `type_tag` + `dynamic_cast`-style capability layer | Not ported — compile-time-only `sizeof` macros |
+| Physical vs. logical size | Both tracked separately per object | Capacity only, like `malloc_usable_size` |
+| Free-list linkage | Explicit `next_free` field in every block header | Overlaid on a free block's own (otherwise unused) payload bytes — costs nothing on a live block |
+| Namespace / cgroup enforcement | Yes | Yes, unchanged |
+| Bounds-checked offset resolution | Yes | Yes, unchanged in spirit |
+| CHERI-like capability layer | Yes (`shm_cap.*`) | Not ported (built entirely on the fields removed above) |
+| C++ typed wrappers | Yes | Not ported yet |
+
+### Memory layout
+
+```
+base[0]              base + name_offset       base + data_offset
+  │                        │                         │
+  ▼                        ▼                         ▼
+┌──────────────────┬───────────────────────────┬────────────────────────┐
+│  region header    │  name table (optional,    │  heap (16-byte-header  │
+│                   │  fixed small capacity)    │  blocks, implicit list)│
+└──────────────────┴───────────────────────────┴────────────────────────┘
+```
+
+There is no separate directory zone. The heap itself is the only place
+objects live; enumeration walks it directly (see `shm_slim_walk()` below).
+
+### The 16-byte block header
+
+```c
+typedef struct shm_slim_hdr {
+    uint32_t magic;   /* SHM_SLIM_MAGIC_LIVE / _LIVE_NAMED / _FREE */
+    uint32_t key;     /* access-control key; 0 = SHM_SLIM_KEY_OPEN (no check) */
+    uint64_t size;    /* total block size (header + payload), 8-byte aligned */
+} shm_slim_hdr_t;   /* sizeof == 16, enforced by _Static_assert */
+```
+
+- **`magic`** distinguishes live-anonymous, live-named, and free — the same
+  corruption guard v2 has, plus it's how `shm_slim_free()`/`shm_slim_resize()`
+  know whether to bother touching the (tiny) name table at all: anonymous
+  objects, expected to be the overwhelming majority, skip that check entirely.
+- **`key`** is the entire access-control model: `SHM_SLIM_KEY_OPEN` (0) means
+  unprotected (anyone may access it); any other value must be matched exactly
+  by every subsequent `shm_slim_ptr` / `shm_slim_free` / `shm_slim_resize` /
+  `shm_slim_lookup_by_name` call. No owner identity, no per-operation
+  permission bits, no admin bypass — a bearer token, not RBAC.
+- **`size`** is the block's total size including this header; payload
+  capacity is always `size - 16`. Forward heap traversal is
+  `next_block = this_block + this_block->size` — an implicit list, like a
+  boundary-tag malloc, needing no explicit next-pointer for live blocks.
+- Reverse lookup (payload offset → header) is always `header = off - 16`,
+  unconditionally, whether the object is named or not — naming information
+  lives entirely outside the block (in the name table), never as a
+  variable-length prefix inside it, specifically so this stays O(1) and
+  unconditional.
+- A **free** block's free-list link is stored *in its own payload bytes*
+  (the first 8 bytes after the header) rather than as a header field — the
+  same technique classic `dlmalloc`-style allocators use to overlay `fd`/`bk`
+  on free chunks. This is why the minimum block size is 24 bytes (16-byte
+  header + 8 bytes of reserved link space), not 16: every block needs room
+  for that link once freed, even if its live payload was smaller.
+
+### The name table
+
+```c
+typedef struct shm_slim_name_entry {
+    char      name[24];  /* name[0] == 0 -> empty slot */
+    shm_off_t off;        /* payload offset of the named object */
+} shm_slim_name_entry_t;   /* 32 bytes/slot */
+```
+
+Sized by `name_capacity` at creation (default 64 slots = 2 KiB). This is for
+naming a handful of well-known root/entry-point objects for multi-host
+discovery — e.g. the same `"graph_csr"`-style example used elsewhere in this
+README — not for naming every object. Anonymous objects cost zero bytes
+here. Duplicate names are rejected (`EEXIST`); an object's name-table entry
+is removed on free and its offset is updated automatically if a resize
+relocates it.
+
+### Incompatibility with v2
+
+The version field is the literal 4-byte ASCII word `"slim"`
+(`SHM_SLIM_VERSION = 0x736C696D`), not an incrementing integer. v2 stores an
+integer (`2`) and rejects any region whose version isn't that integer; this
+format stores `"slim"` and rejects any region whose version isn't that word.
+The two encodings can never collide, so a v2 region opened with the slim
+code (or vice versa) fails cleanly with `ENOENT` instead of misinterpreting
+the layout. The region magic (`"SHMA"`) is intentionally left shared between
+the two — it only asserts "this is an shm_alloc-family region," which is
+true of both; the version field is what actually gates compatibility.
+
+### C API quick reference
+
+```c
+#include "shm_slim.h"
+
+// Create a region (name table defaults to 64 slots if unset).
+shm_slim_region_open_opts_t opts = {
+    .backend = SHM_SLIM_BACKEND_POSIX,
+    .flags   = SHM_SLIM_OPEN_CREATE,
+};
+shm_slim_region_t *region;
+shm_slim_region_open("/my_pool", 1 << 20, &opts, &region);
+
+// Anonymous allocation -- 16 bytes of metadata, no name-table cost.
+shm_off_t off;
+shm_slim_alloc(region, 64, /*name=*/NULL, /*key=*/0xCAFEu, &off);
+
+// Access requires the same key.
+void *p = shm_slim_ptr(region, off, 0xCAFEu);          // succeeds
+void *q = shm_slim_ptr(region, off, 0xDEADu);          // NULL: wrong key
+// SHM_SLIM_KEY_OPEN (0) means "no protection": any key is accepted.
+
+// Named allocation for discovery/bootstrapping.
+shm_off_t root;
+shm_slim_alloc(region, sizeof(MyRoot), "graph_root", 0xCAFEu, &root);
+shm_slim_lookup_by_name(region, "graph_root", 0xCAFEu, &root);
+
+// Resize may relocate; the (possibly new) offset is always returned
+// directly -- there is no per-object directory entry to re-query.
+shm_off_t new_off;
+shm_slim_resize(region, off, 4096, 0xCAFEu, &new_off);
+
+// Enumerate every live object by walking the heap (no directory to scan).
+uint64_t cursor = 0;
+shm_slim_entry_t e;
+while (shm_slim_walk(region, &cursor, &e) == 0) {
+    printf("off=%llu size=%zu name=%s\n", e.off, e.size, e.name);
+}
+
+shm_slim_free(region, off, 0xCAFEu);
+shm_slim_region_close(region, /*unlink=*/true);
+```
+
+### What was deliberately not ported, and why
+
+| Dropped | Why |
+|---|---|
+| Object directory | The entire point — this was the O(n)-per-object storage cost that didn't scale |
+| Monotonic object IDs | Redundant with the offset handle, which was always the real handle passed around |
+| Owner ID + permission bitmask + admin bypass | Not on the keep list; replaced by a single access-control key |
+| `type_tag` / runtime type checks | Not on the keep list |
+| CHERI-like capability layer (`shm_cap.*`) | Built entirely on the owner/perms/obj_id/payload_cap fields being removed; would need its own redesign around the key field |
+| C++ typed wrappers | Depended on `type_tag`; could be re-added later as sizeof-only macros |
+
+Namespace/cgroup enforcement and bounds-checked offset resolution were
+**kept unchanged in spirit** — both are essential to the project's safety
+story and neither one scales per object (namespace/cgroup fingerprints are
+O(1) per region; bounds checking is O(1) per call), so neither was part of
+the metadata-size problem in the first place.
+
+### Honest limits
+
+- 16 bytes is fixed overhead, not a promise that metadata shrinks below the
+  data: at the motivating example's own ratio (~7 bytes of payload per
+  object on average), a 16-byte header is still larger than the payload.
+  The real claim is a ~9.5x reduction versus v2 and landing within ~2-3x of
+  the data instead of ~20x over it — see `tests/test_slim_scale.c` for the
+  exact, reproducible numbers (computed from the real `sizeof()` values at
+  build time, not hard-coded).
+- Named objects still cost a 32-byte name-table slot each. Nothing enforces
+  that naming stays rare — that's a usage convention (name a few roots, not
+  every object), not an API-level guarantee.
+- There is no read/write distinction and no per-operation permission bits —
+  a matching key grants full access, same as a bearer token. If you need
+  finer-grained access control than "has the key or doesn't," that's a
+  deliberate simplification you'd need to build on top (e.g. different keys
+  for different sub-objects).
+
+---
+
+## Running v2 code on the slim engine
+
+`shm_slim.h` additionally declares v2's exact public names and signatures —
+`shm_region_t`, `shm_region_open_opts_t`, `shm_pool_stats_t`,
+`SHM_PERM_*`/`SHM_OPEN_*`, `shm_region_open`/`close`/`base`/`size`,
+`shm_alloc`/`shm_free`/`shm_resize`/`shm_ptr`/`shm_pool_stats`, and the
+`shm_alloc_typed`/`shm_cast`/`shm_cast_mut`/`shm_free_id` macros — so code
+written against v2 can run on the slim engine by **only changing which
+header it includes**:
+
+```diff
+- #include "shm_alloc.h"
++ #include "shm_slim.h"
+```
+
+...and linking `shm_slim.o` + `shm_slim_compat.o` + `shm_ns.o` instead of
+`shm_alloc.o` + `shm_ns.o`. No other source change. `test-prog/objstream_alloc.cpp`
+is a real, unmodified example of exactly this — see
+[`test-prog/`](test-prog/) and [WIP.md](WIP.md) for the full verification,
+including that its allocator metadata stays at a constant ~2.2 KB across a
+600,000-object run where v2 would need ~91 MB.
+
+This is a **compatibility layer**, not a second full implementation of v2's
+feature set — `user_id`+`perms` collapse into the slim engine's one access
+key, `type_tag` is accepted but not persisted, `obj_id` is just the offset
+(`id == off`), and there is deliberately no compatibility shim for
+`shm_lookup(id)` / `shm_dir_next` / `shm_dir_read_slot` / `shm_block_info` /
+`shm_block_set_perms` — faithfully replicating those needs the per-object
+directory this format exists to eliminate. See the "What was deliberately
+not ported" table above and WIP.md for the complete mapping and rationale.
+
+**Never `#include` both `shm_alloc.h` and `shm_slim.h` in the same file**
+without first `#define SHM_SLIM_NO_V2_COMPAT` — both declare `shm_alloc()`,
+`shm_ptr()`, and friends with the same names, and the compiler will
+correctly refuse the conflicting declarations. Defining that macro before
+including `shm_slim.h` skips its v2-compatible section entirely, leaving
+only the native `shm_slim_*` API (see `tests/test_generic_backend.c` for a
+real example that needs exactly this).
+
+---
+
 ## File structure
 
 ```
 include/
-  shm_alloc.h      C public API (types, constants, all function declarations)
-  shm_alloc.hpp    C++ typed wrappers (shm::ptr<T>, make, cast, find, free)
-  shm_cap.h        C capability API (shm_cap_t, derive, deref, narrow, …)
-  shm_cap.hpp      C++ typed capability wrapper (shm::cap<T>)
+  shm_alloc.h        v2 C public API (types, constants, all function declarations)
+  shm_alloc.hpp      v2 C++ typed wrappers (shm::ptr<T>, make, cast, find, free)
+  shm_cap.h          v2 C capability API (shm_cap_t, derive, deref, narrow, …)
+  shm_cap.hpp        v2 C++ typed capability wrapper (shm::cap<T>)
+  shm_slim.h         v0.2 "slim" public API, PLUS a v2-compatible API section
+                     (see "Running v2 code on the slim engine" above)
 src/
-  shm_internal.h   Internal layout types + inline helpers (shm_block_hdr_t, …)
-  shm_persist.h    Cache-line flush / write-back helpers (CLFLUSH/CLWB/CBO/none)
-  shm_alloc.c      Core allocator (region, heap, directory, resize)
-  shm_cap.c        CHERI-like capability layer (derive, deref, validate)
-  shm_ns.h         Internal: IPC namespace + cgroup fingerprint declarations
-  shm_ns.c         Internal: /proc/self/ns/ipc inode + FNV-1a cgroup hash
+  shm_internal.h     v2 internal layout types + inline helpers (shm_block_hdr_t, …)
+  shm_persist.h      Cache-line flush / write-back helpers (shared by v2 and slim)
+  shm_alloc.c        v2 core allocator (region, heap, directory, resize)
+  shm_cap.c          v2 CHERI-like capability layer (derive, deref, validate)
+  shm_ns.h           Internal: IPC namespace + cgroup fingerprint decls (shared)
+  shm_ns.c           Internal: /proc/self/ns/ipc inode + FNV-1a cgroup hash (shared)
+  shm_slim_internal.h v0.2 internal layout (16-byte shm_slim_hdr_t, name table, …)
+  shm_slim.c         v0.2 implementation -- self-contained, does not include
+                     shm_internal.h or shm_alloc.h
+  shm_generic_backend.h  optional jemalloc/tcmalloc/cxlalloc/ralloc backend,
+                     shared by shm_alloc.c and shm_slim.c
+  shm_slim_compat.c  v2-compatible API bodies on the slim engine -- a
+                     SEPARATE translation unit from shm_slim.c; never link
+                     this alongside shm_alloc.o (duplicate shm_alloc()/etc.)
 tests/
-  test_basic.c     open/close, alloc, lookup, permissions, multi-object,
-                   parallel slot-partitioned directory reads
-  test_resize.c    shrink, in-place grow, relocation grow, permission check
-  test_multihost.c fork-based multi-process discovery, NS enforcement
-  test_cap.c       capability derive, deref, tag bit, ABA, narrowing, forgery
-  test_bounds.c    bounds-checked offset resolution: bad offsets, corrupted
-                   headers, corrupted directory entries (EFAULT/EINVAL/NULL)
+  test_basic.c       v2: open/close, alloc, lookup, permissions, multi-object,
+                     parallel slot-partitioned directory reads
+  test_resize.c      v2: shrink, in-place grow, relocation grow, permission check
+  test_multihost.c   v2: fork-based multi-process discovery, NS enforcement
+  test_cap.c         v2: capability derive, deref, tag bit, ABA, narrowing, forgery
+  test_bounds.c      v2: bounds-checked offset resolution (EFAULT/EINVAL/NULL)
+  test_slim_basic.c  v0.2: alloc/free/resize, naming, key access control, walk, stats
+  test_slim_bounds.c v0.2: bad-offset/corrupted-header/corrupted-chain safety
+  test_slim_scale.c  v0.2: proves the metadata-overhead claim, empirically and
+                     via a projection at the motivating 300M-object scale
+  test_generic_backend.c  both: SHM_BACKEND_GENERIC / SHM_SLIM_BACKEND_GENERIC,
+                     with and without a backend selected
+  test_slim_v2compat.c  v2-compatible API section, running on the slim engine
 Makefile
+WIP.md               v0.2 design rationale, decisions, and status log
+test-prog/           STREAM-style benchmarks; objstream_alloc.cpp is a real
+                     example of v2-style code running on the slim engine
+                     via the v2-compatible API (see WIP.md)
 ```
