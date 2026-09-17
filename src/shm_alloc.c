@@ -52,6 +52,17 @@
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  Free hook (extension point for optional layers, e.g. shm_hwcap.h)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static shm_free_hook_t g_free_hook = NULL;
+
+void shm_set_free_hook(shm_free_hook_t hook)
+{
+    g_free_hook = hook;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Permission checking
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -826,6 +837,9 @@ int shm_free(shm_region_t *region,
         region_unlock(region);
         return acc;
     }
+
+    if (g_free_hook)
+        g_free_hook(region, obj_id, slot->off, slot->owner, slot->perms);
 
     shm_block_hdr_t *b = shm_blk_of_poff(region, slot->off);
     heap_free_block(region, b);        /* clears allocated (tag bit), links, persists */

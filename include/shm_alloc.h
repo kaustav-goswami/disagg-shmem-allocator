@@ -424,6 +424,35 @@ int shm_block_set_perms(shm_region_t *region,
                         shm_perm_t    caller_perms,
                         shm_perm_t    new_perms);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Free hook (extension point for optional layers, e.g. shm_hwcap.h)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Callback invoked by shm_free() for every successful free, just before the
+ * directory entry and block header are cleared. @p off, @p owner and
+ * @p perms reflect the object as it was immediately before this free.
+ */
+typedef void (*shm_free_hook_t)(const shm_region_t *region,
+                                uint64_t             obj_id,
+                                shm_off_t            off,
+                                shm_user_id_t        owner,
+                                shm_perm_t           perms);
+
+/**
+ * @brief Register (or clear) a process-local hook run on every shm_free().
+ *
+ * This is a process-local extension point, not a shared-memory feature: it
+ * exists so optional layers built on top of shm_alloc (such as the hardware
+ * capability bridge in shm_hwcap.h) can keep external state — e.g. a
+ * hardware token table — in sync with software frees, without shm_alloc.c
+ * itself needing to know that layer exists. At most one hook is active per
+ * process; calling this again replaces the previous hook.
+ *
+ * @param hook  Callback to install, or NULL to remove any existing hook.
+ */
+void shm_set_free_hook(shm_free_hook_t hook);
+
 /**
  * @brief Return aggregate pool statistics (does not require a lock).
  *

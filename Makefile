@@ -42,9 +42,14 @@ BUILD = build
 LIB_OBJS     = $(BUILD)/shm_alloc.o $(BUILD)/shm_ns.o
 LIB_OBJS_CAP = $(LIB_OBJS) $(BUILD)/shm_cap.o
 
+# shm_hwcap.o is the optional hardware-capability bridge (shm_hwcap.h); it
+# depends on shm_cap.o. shm_hwcap_mock.o is the software CEU emulator used to
+# exercise that bridge without real CapCXL hardware present.
+LIB_OBJS_HWCAP = $(LIB_OBJS_CAP) $(BUILD)/shm_hwcap.o $(BUILD)/shm_hwcap_mock.o
+
 # ── Test binaries ────────────────────────────────────────────────────────────
 TESTS = $(BUILD)/test_basic $(BUILD)/test_resize $(BUILD)/test_multihost \
-        $(BUILD)/test_cap
+        $(BUILD)/test_cap $(BUILD)/test_hwcap
 
 .PHONY: all test clean
 
@@ -68,6 +73,18 @@ $(BUILD)/shm_cap.o: src/shm_cap.c include/shm_cap.h src/shm_internal.h \
                     src/shm_persist.h include/shm_alloc.h | $(BUILD)
 	$(CC) $(CFLAGS) -c src/shm_cap.c -o $@
 
+# shm_hwcap.c bridges shm_cap_t to an optional hardware token backend and
+# also uses shm_internal.h to read block headers directly.
+$(BUILD)/shm_hwcap.o: src/shm_hwcap.c include/shm_hwcap.h include/shm_cap.h \
+                      src/shm_internal.h include/shm_alloc.h | $(BUILD)
+	$(CC) $(CFLAGS) -c src/shm_hwcap.c -o $@
+
+# shm_hwcap_mock.c is a software CEU emulator implementing shm_hwcap_ops_t;
+# it only depends on the public shm_hwcap.h contract.
+$(BUILD)/shm_hwcap_mock.o: src/shm_hwcap_mock.c include/shm_hwcap_mock.h \
+                           include/shm_hwcap.h | $(BUILD)
+	$(CC) $(CFLAGS) -c src/shm_hwcap_mock.c -o $@
+
 # ── Compile and link tests ────────────────────────────────────────────────────
 $(BUILD)/test_basic: tests/test_basic.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_basic.c $(LIB_OBJS) $(LDFLAGS)
@@ -82,6 +99,11 @@ $(BUILD)/test_multihost: tests/test_multihost.c $(LIB_OBJS) | $(BUILD)
 $(BUILD)/test_cap: tests/test_cap.c $(LIB_OBJS_CAP) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_cap.c $(LIB_OBJS_CAP) $(LDFLAGS)
 
+# test_hwcap exercises the hardware-capability bridge against the mock
+# CEU backend; links against LIB_OBJS_HWCAP.
+$(BUILD)/test_hwcap: tests/test_hwcap.c $(LIB_OBJS_HWCAP) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/test_hwcap.c $(LIB_OBJS_HWCAP) $(LDFLAGS)
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 test: all
 	@echo "─── test_basic ──────────────────"
@@ -92,6 +114,8 @@ test: all
 	./$(BUILD)/test_multihost
 	@echo "─── test_cap ────────────────────"
 	./$(BUILD)/test_cap
+	@echo "─── test_hwcap ───────────────────"
+	./$(BUILD)/test_hwcap
 
 # ── Remove build artifacts ────────────────────────────────────────────────────
 clean:
@@ -108,3 +132,4 @@ clean:
 	-rm -f /dev/shm/shm_test_multihost
 	-rm -f /dev/shm/shm_test_ns_enforce
 	-rm -f /dev/shm/test_cap_region
+	-rm -f /dev/shm/test_hwcap_region

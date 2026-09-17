@@ -180,6 +180,14 @@ caller supplies:  user_id  +  caller_perms  +  required_perms
 | `SHM_BACKEND_POSIX` | default | `shm_open("/name")` + `mmap(MAP_SHARED)` |
 | `SHM_BACKEND_DAX`   | `opts.backend = SHM_BACKEND_DAX` | `open("/dev/dax0.0")` + `mmap(MAP_SHARED)`, no `ftruncate` |
 
+**Running on CapCXL hardware:** to make the heap physically live in the
+FPGA-attached DDR4 behind CapCXL's Type3/SAT path, open with
+`SHM_BACKEND_DAX` pointed at the `/dev/daxX.Y` node the CapCXL kernel driver
+exposes for that HDM region — no other code change is needed to get the
+allocator itself running over CXL memory. Pairing that with the hardware
+capability bridge below is what gets a per-object hardware token in
+addition to the region-level SAT check.
+
 ---
 
 ## Multi-host discovery
@@ -637,6 +645,152 @@ the disaggregated-memory threat model.
 
 ---
 
+## Hardware capability bridge (CapCXL integration)
+
+`shm_cap_t` is checked entirely in software. The
+[CapCXL](https://github.com/Zettai-US/CapCXL) FPGA project additionally
+enforces a *hardware* capability check on its CXL Type2 path: a Capability
+Extension Unit (CEU) verifies a 6-bit token embedded in the pointer's LAM
+bits against a hardware shadow-register file on every AXI access,
+independent of whatever userspace is doing. `shm_hwcap.h` bridges the two —
+a capability can carry a hardware token alongside its software half, and a
+dereference only succeeds when **both** layers agree.
+
+This layer is optional and purely additive, the same way the capability
+layer itself is additive over `shm_off_t`: code that never calls
+`shm_hwcap_set_backend()` gets pure `shm_cap_t` behavior with zero overhead.
+
+### Architecture
+
+```
+                    shm_hwcap_derive()/deref()
+                              │
+              ┌───────────────┴────────────────┐
+              ▼                                 ▼
+      shm_cap_derive()/deref()          shm_hwcap_ops_t (pluggable)
+      (software: tag/epoch/bounds/       register_region / revoke_region /
+       perms — see previous section)     verify_region
+                                                  │
+                                   ┌──────────────┴───────────────┐
+                                   ▼                               ▼
+                     shm_hwcap_mock.h (this repo)        CapCXL adapter (out of
+                     64-slot software CEU emulator,      scope for this repo —
+                     used by tests/test_hwcap.c           see "Writing a real
+                                                            adapter" below)
+```
+
+`shm_alloc.c` itself has no knowledge of any of this — `shm_hwcap.c` hooks in
+through one process-local extension point, `shm_set_free_hook()`, so that
+`shm_free()` automatically revokes any hardware token bound to the object
+being freed, keeping the hardware token table and the software directory in
+sync without a revocation scan.
+
+### Why permission bits needed an explicit mapping
+
+`shm_perm_t` (`READ=0x01`, `WRITE=0x02`, `FREE=0x04`, `RESIZE=0x08`,
+`ADMIN=0x80`) and CapCXL's hardware permission byte (`READ=0x1`, `WRITE=0x2`,
+`EXEC=0x4`) are independent bit assignments that collide at `0x04`: on the
+software side that bit means *"may free this object"*; on the hardware side
+the same bit means *"may execute this memory as code."* A raw cast between
+the two would silently grant execute permission to any capability that only
+grants `FREE`. `shm_hwcap.h` provides explicit, tested translation instead:
+
+| `shm_perm_t` bit | Hardware bit  | Crosses the bridge? |
+|------------------|---------------|----------------------|
+| `SHM_PERM_READ`   (0x01) | `SHM_HWCAP_PERM_READ`  (0x1) | Yes |
+| `SHM_PERM_WRITE`  (0x02) | `SHM_HWCAP_PERM_WRITE` (0x2) | Yes |
+| `SHM_PERM_FREE`   (0x04) | — collides with `EXEC` (0x4) | **No — dropped** |
+| `SHM_PERM_RESIZE` (0x08) | *(no hardware meaning)* | No — dropped |
+| `SHM_PERM_ADMIN`  (0x80) | *(no hardware meaning)* | No — dropped |
+
+```c
+shm_hwcap_perm_t hw = shm_perm_to_hwcap(SHM_PERM_READ | SHM_PERM_FREE);
+/* hw == SHM_HWCAP_PERM_READ — FREE never becomes EXEC */
+```
+
+### Graceful degradation
+
+A hardware token is best-effort, never load-bearing for correctness:
+
+- No backend installed → every derive is software-only (`hw_token ==
+  SHM_HWCAP_TOKEN_NONE`); behavior is identical to calling `shm_cap_derive()`
+  directly.
+- Backend installed but its token table is full (mirrors a full 64-entry CEU
+  shadow-register file) → `shm_hwcap_derive()` still returns a valid
+  software capability, just without a hardware token.
+- Backend removed via `shm_hwcap_clear_backend()` → any capability holding a
+  stale `hw_token` is treated as software-only from that point on.
+
+In every case the software checks from the previous section still apply in
+full; the hardware check can only make a dereference *stricter*, never more
+permissive.
+
+### C API quick reference
+
+```c
+#include "shm_hwcap.h"
+#include "shm_hwcap_mock.h"   /* or a real CapCXL adapter */
+
+/* Install a backend (mock shown; see "Writing a real adapter" below). */
+shm_hwcap_mock_t *mock = shm_hwcap_mock_create();
+shm_hwcap_ops_t   ops  = shm_hwcap_mock_ops(mock);
+shm_hwcap_set_backend(&ops);
+
+/* Derive: always gets a software capability; gets a hardware token too if
+ * a backend is installed and its token table has room. */
+shm_hwcap_t cap = shm_hwcap_derive(region, off, uid, caller_perms, grant_perms);
+
+/* Deref: software checks first, then hardware re-verification if bound. */
+MyObj *p = (MyObj *)shm_hwcap_deref(region, cap, SHM_PERM_READ | SHM_PERM_WRITE);
+
+/* Explicit revoke ahead of a free (shm_free() also does this automatically). */
+shm_hwcap_revoke(&cap);
+
+bool has_hw_backing = shm_hwcap_is_bound(cap);
+```
+
+**Do not store or transmit `shm_hwcap_t`.** Unlike `shm_cap_t`, `hw_token`
+names an entry in *one host's* hardware (or emulated) token table — it means
+nothing on another host and must never be written into the shared region.
+Exchange the plain `shm_off_t` or `shm_cap_t` between hosts instead, and have
+each host derive its own hardware token locally.
+
+### Writing a real adapter
+
+`shm_hwcap_ops_t` has no dependency on the CapCXL repository — a real
+adapter living there would implement it roughly as:
+
+```c
+register_region(ctx, ptr, size, perms, &token)
+    -> __capcxl_register_region(ptr, size, perms)   /* capcxl_runtime.h */
+       issues CEU_CMD_GEN_TOKEN over MMIO; recover the 6-bit token from
+       the LAM-encoded pointer it returns (CAPCXL_LAM_MASK / LAM_BIT_LO).
+
+revoke_region(ctx, token)
+    -> CEU_CMD_REVOKE for that token (MMIO_CEU_CMD / MMIO_CEU_TOKEN_IN).
+
+verify_region(ctx, token, ptr, required_perms)
+    -> CEU_CMD_VERIFY, or return 0 unconditionally if the hardware already
+       enforces the check on the AXI data path and offers no separate
+       software-visible status register.
+```
+
+That adapter is intentionally **out of scope for this repository** — it
+requires linking against CapCXL's runtime headers, which live in a separate
+project with its own build (Quartus/RTL). This repo only defines the
+interface and ships a software emulator (`shm_hwcap_mock.h`) so the bridge
+can be developed and tested well ahead of real hardware bring-up.
+
+### Also out of scope for this branch
+
+CapCXL's own `sw/runtime/capcxl_malloc.c` currently implements its own bump
+allocator for the arena it registers with the CEU. Replacing that with calls
+into this library's `shm_alloc()`/`shm_free()` (to pick up the object
+directory, multi-host discovery, and resize support here) is a change to the
+CapCXL repository, not to `shm_alloc`, and is not part of this branch.
+
+---
+
 ## Cache persistence (clflush / clwb / cbo)
 
 By default `shm_alloc` does not issue any cache-flush or write-back
@@ -729,11 +883,15 @@ include/
   shm_alloc.hpp    C++ typed wrappers (shm::ptr<T>, make, cast, find, free)
   shm_cap.h        C capability API (shm_cap_t, derive, deref, narrow, …)
   shm_cap.hpp      C++ typed capability wrapper (shm::cap<T>)
+  shm_hwcap.h      Hardware-capability bridge (shm_hwcap_t, pluggable ops table)
+  shm_hwcap_mock.h Software CEU emulator implementing shm_hwcap_ops_t
 src/
   shm_internal.h   Internal layout types + inline helpers (shm_block_hdr_t, …)
   shm_persist.h    Cache-line flush / write-back helpers (CLFLUSH/CLWB/CBO/none)
-  shm_alloc.c      Core allocator (region, heap, directory, resize)
+  shm_alloc.c      Core allocator (region, heap, directory, resize, free hook)
   shm_cap.c        CHERI-like capability layer (derive, deref, validate)
+  shm_hwcap.c      Hardware-capability bridge implementation + token tracking
+  shm_hwcap_mock.c Software CEU emulator (64-slot register/verify/revoke)
   shm_ns.h         Internal: IPC namespace + cgroup fingerprint declarations
   shm_ns.c         Internal: /proc/self/ns/ipc inode + FNV-1a cgroup hash
 tests/
@@ -741,5 +899,6 @@ tests/
   test_resize.c    shrink, in-place grow, relocation grow, permission check
   test_multihost.c fork-based multi-process discovery, NS enforcement
   test_cap.c       capability derive, deref, tag bit, ABA, narrowing, forgery
+  test_hwcap.c     perm mapping, token bridge, free-hook revoke, degradation
 Makefile
 ```
