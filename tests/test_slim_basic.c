@@ -184,11 +184,17 @@ static void test_named_objects(void)
     rc = shm_slim_alloc_typed(r, record_t, "root", 55u, &off2);
     CHECK_ERR(rc, EEXIST, "allocating a duplicate name returns EEXIST");
 
-    /* Name table exhaustion (capacity is 4; "root" already used 1 slot). */
+    /* Name table exhaustion. Requested capacity was 4, but the physical
+     * table is inflated beyond that to keep the hash table's load factor
+     * low (see shm_slim_name_entry_t's comment in shm_slim_internal.h) --
+     * ask the region itself how big it actually is rather than assuming
+     * physical == requested. */
+    shm_slim_pool_stats_t stats;
+    shm_slim_pool_stats(r, &stats);
     char name[SHM_SLIM_NAME_MAX];
     int last_rc = 0;
-    for (int i = 0; i < 4; i++) {
-        snprintf(name, sizeof(name), "n%d", i);
+    for (uint32_t i = 0; i < stats.name_capacity + 4; i++) {
+        snprintf(name, sizeof(name), "n%u", i);
         shm_off_t o;
         last_rc = shm_slim_alloc_typed(r, record_t, name, 1u, &o);
         if (last_rc != 0) break;
@@ -345,6 +351,77 @@ static void test_pool_stats(void)
     shm_slim_region_close(r, true);
 }
 
+/*
+ * The name table became an open-addressed hash table (FNV-1a + linear
+ * probing + tombstone deletion) to fix the O(name_capacity) per-call cost
+ * of the old linear scan -- see WIP.md. That's a correctness-sensitive
+ * change: a probe sequence that stops too early at a tombstone, or a
+ * delete that clobbers a neighboring entry's reachability, would silently
+ * lose or misresolve names. This stress test churns a fixed set of
+ * logical slots through many delete+republish-under-a-new-name cycles
+ * (the same pattern sh6bench.c's ring buffer produces, at a similarly
+ * high load factor relative to the *requested* capacity) and verifies
+ * every name's liveness matches what the test itself tracked -- no
+ * false hits on deleted names, no lost live ones.
+ */
+static void test_name_table_hash_stress(void)
+{
+    puts("\n[test_name_table_hash_stress]");
+
+    shm_slim_region_t *r = NULL;
+    shm_slim_region_open_opts_t opts = {
+        .backend = SHM_SLIM_BACKEND_POSIX, .flags = SHM_SLIM_OPEN_CREATE,
+        .name_capacity = 32,
+    };
+    shm_slim_region_open("/shm_slim_test_hash_stress", 4 << 20, &opts, &r);
+
+    const int kSlots = 32;
+    char names[32][SHM_SLIM_NAME_MAX];
+    bool alive[32];
+
+    int initial_ok = 1;
+    for (int i = 0; i < kSlots; i++) {
+        snprintf(names[i], sizeof(names[i]), "s%d", i);
+        shm_off_t off;
+        alive[i] = (shm_slim_alloc_typed(r, record_t, names[i], 1u, &off) == 0);
+        if (!alive[i]) initial_ok = 0;
+    }
+    CHECK(initial_ok, "initial fill: all 32 requested slots published successfully");
+
+    /* Deterministic PRNG (fixed seed) -- reproducible, no real randomness dependency. */
+    unsigned seed = 12345u;
+    const int kCycles = 500;
+    int op_failed = 0;
+    for (int cycle = 0; cycle < kCycles && !op_failed; cycle++) {
+        for (int i = 0; i < kSlots; i++) {
+            seed = seed * 1103515245u + 12345u;
+            if ((seed >> 16) % 3 == 0) {
+                if (alive[i]) {
+                    if (shm_slim_free_by_name(r, names[i], 1u, NULL) != 0) { op_failed = 1; break; }
+                    alive[i] = false;
+                }
+            } else if (!alive[i]) {
+                snprintf(names[i], sizeof(names[i]), "s%d_c%d", i, cycle);
+                shm_off_t off;
+                if (shm_slim_alloc_typed(r, record_t, names[i], 1u, &off) != 0) { op_failed = 1; break; }
+                alive[i] = true;
+            }
+        }
+    }
+    CHECK(!op_failed, "500 churn cycles of delete+republish complete without a spurious failure");
+
+    int mismatches = 0;
+    for (int i = 0; i < kSlots; i++) {
+        shm_off_t off;
+        bool found = (shm_slim_lookup_by_name(r, names[i], 1u, &off) == 0);
+        if (found != alive[i]) mismatches++;
+    }
+    CHECK(mismatches == 0,
+          "after churn, every tracked name's liveness matches this test's own bookkeeping exactly");
+
+    shm_slim_region_close(r, true);
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -359,6 +436,7 @@ int main(void)
     test_resize_updates_name_table();
     test_walk();
     test_pool_stats();
+    test_name_table_hash_stress();
 
     if (g_failed) {
         fprintf(stderr, "\nSome tests FAILED.\n");

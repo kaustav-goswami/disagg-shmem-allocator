@@ -116,6 +116,16 @@ typedef uint32_t shm_slim_key_t;
 /** Default name-table capacity when the caller does not specify one. */
 #define SHM_SLIM_NAME_CAP_DEFAULT  64u
 
+/* ── Namespace binding ───────────────────────────────────────────────────── */
+
+/**
+ * Default key->namespace table capacity when the caller does not specify
+ * one. Optional: a deployment that never calls shm_slim_namespace_bind()
+ * pays nothing extra beyond this small, fixed-size, empty table -- access
+ * control is key-only by default (see shm_slim_namespace_check()).
+ */
+#define SHM_SLIM_NAMESPACE_CAP_DEFAULT  64u
+
 /* ── Backend ─────────────────────────────────────────────────────────────── */
 
 typedef enum shm_slim_backend {
@@ -145,7 +155,49 @@ typedef struct shm_slim_region_open_opts {
     shm_slim_backend_t backend;         /* which storage backend (default POSIX) */
     uint32_t            flags;          /* bitwise OR of SHM_SLIM_OPEN_* */
     uint32_t            name_capacity;  /* max named objects (0 -> default 64) */
+    uint32_t            namespace_capacity; /* max key->namespace bindings (0 -> default 64) */
     mode_t               mode;          /* file permission bits (0 -> 0660) */
+    /*
+     * shm_slim_region_open_fd() only: if nonzero, used directly as fd's
+     * mapped size instead of auto-detecting via shm_slim_fd_size().
+     * fstat()+sysfs auto-detection is not reliable for every DAX/CXL
+     * device node in the wild (confirmed: works for some /dev/daxX.Y
+     * nodes, fails -- reports 0 -- for at least one real /dev/cxl/memN
+     * node seen in practice); this is the escape hatch when it doesn't
+     * work, not a replacement for trying auto-detection first.
+     *
+     * DANGEROUS IF SET LARGER THAN THE FD CAN ACTUALLY BACK: this value
+     * goes straight into mmap()'s length. mmap() happily succeeds with an
+     * oversized length; touching memory past the real extent is a SIGBUS
+     * crash (confirmed directly), not a clean error. Set it to the
+     * backing device's real, known capacity or less -- never a guess.
+     *
+     * Ignored (auto-detect as before) when 0. Ignored entirely by
+     * shm_slim_region_open() (name/path-based), which already has its own
+     * explicit `size` parameter for the same purpose.
+     */
+    size_t               size_hint;
+    /*
+     * If non-NULL, mmap() is called with MAP_FIXED_NOREPLACE at exactly
+     * this address instead of the usual mmap(NULL, ...) (OS/ASLR-chosen).
+     *
+     * Every other feature in this engine is deliberately offset-based
+     * (shm_off_t, not raw pointers) specifically so cross-process sharing
+     * never depends on two processes mapping a region at the same VA. This
+     * field exists only for callers with a pre-existing design that
+     * assumes the opposite -- raw pointers embedded directly in shared
+     * data, valid only if every attaching process maps at the identical
+     * address (e.g. memcached's own shm backend; see
+     * test-prog/memcached/demalloc's graph... shm_backend.c). New code
+     * should prefer shm_slim_ptr()/offsets and leave this NULL.
+     *
+     * MAP_FIXED_NOREPLACE (not MAP_FIXED) so a collision with an existing
+     * mapping at that address fails cleanly (EEXIST) instead of silently
+     * clobbering it. All attaching processes must pass the same address
+     * the creator used; there is no discovery mechanism for it here --
+     * that is the caller's responsibility, same as size_hint above.
+     */
+    void                *fixed_base;
 } shm_slim_region_open_opts_t;
 
 /* ── Opaque region handle ────────────────────────────────────────────────── */
@@ -199,6 +251,46 @@ int shm_slim_region_open(const char                        *name_or_path,
                           const shm_slim_region_open_opts_t *opts,
                           shm_slim_region_t                **out_region);
 
+/**
+ * @brief Return the real byte size of an already-open backing fd.
+ *
+ * For a regular file (POSIX shm, or anything else `fstat()` reports a
+ * real `st_size` for), this is just `fstat().st_size`. For a `/dev/dax`
+ * character device, `fstat().st_size` is always 0 -- a devdax device's
+ * size is a property of the device itself, exposed via sysfs
+ * (`/sys/dev/char/<major>:<minor>/size`), not the inode -- so this falls
+ * back to reading that when the fd is a character device with a
+ * zero-reported size.
+ *
+ * @return The size in bytes, or 0 if it could not be determined.
+ */
+size_t shm_slim_fd_size(int fd);
+
+/**
+ * @brief Open or create a region directly from a file descriptor the
+ *        caller already opened (and, for a new pool, already sized).
+ *
+ * Unlike shm_slim_region_open(), this never calls ftruncate() -- the size
+ * is always read back from fd itself via shm_slim_fd_size() (fstat(), with
+ * a sysfs fallback for DAX character devices -- see that function). This
+ * is what a formal "d_init(fd, flag, key)"-style entry point (see
+ * include/dmalloc.h) is built on: the caller is responsible for obtaining
+ * and sizing fd (e.g. shm_open()+ftruncate() for POSIX shm, or a
+ * fixed-size DAX device node); this function only takes over the pool
+ * structures within it. The caller retains ownership of fd's lifecycle --
+ * it is never closed here.
+ *
+ * @param fd     Already-open, already-sized (if creating) file descriptor.
+ * @param flags  Bitwise OR of SHM_SLIM_OPEN_* (name_capacity/mode in opts
+ *               are honored on create; backend is not used here).
+ * @return       0 on success; EINVAL (bad fd or too small), EFAULT/errno
+ *               from fstat/mmap, ENOENT (version mismatch on attach), or
+ *               EPERM (namespace/cgroup enforcement) on failure.
+ */
+int shm_slim_region_open_fd(int fd, uint32_t flags,
+                            const shm_slim_region_open_opts_t *opts,
+                            shm_slim_region_t                **out_region);
+
 /** Close and optionally unlink a region. NULL region is a safe no-op. */
 void shm_slim_region_close(shm_slim_region_t *region, bool unlink_name);
 
@@ -249,6 +341,26 @@ int shm_slim_alloc(shm_slim_region_t *region,
 int shm_slim_free(shm_slim_region_t *region,
                    shm_off_t          off,
                    shm_slim_key_t     key);
+
+/**
+ * @brief Free a named object by name, in one hashed pass.
+ *
+ * Equivalent to shm_slim_lookup_by_name() followed by shm_slim_free(), but
+ * cheaper: shm_slim_free() alone still has to find the name-table entry
+ * via an offset-keyed linear scan to remove it (the hash index is keyed by
+ * name, not offset). Since the caller already knows the name here, this
+ * resolves the entry with the SAME hashed lookup and clears it directly --
+ * no second scan. Use this instead of the lookup+free pair whenever the
+ * name is already in hand.
+ *
+ * @param out_off  Optional; receives the freed object's offset.
+ * @return 0 on success; ENOENT if no such name; EACCES if key doesn't
+ *         match; EFAULT if the name table entry is stale/corrupted.
+ */
+int shm_slim_free_by_name(shm_slim_region_t *region,
+                          const char        *name,
+                          shm_slim_key_t     key,
+                          shm_off_t         *out_off);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Resize (grow / shrink)
@@ -305,6 +417,20 @@ int shm_slim_block_size(const shm_slim_region_t *region,
                          shm_slim_key_t           key,
                          size_t                  *out_size);
 
+/**
+ * @brief Recover the offset a local pointer (previously returned by
+ *        shm_slim_ptr()) corresponds to.
+ *
+ * Does not check liveness or a key -- only that ptr falls within the
+ * mapped heap. Combine with shm_slim_block_size() to also confirm the
+ * block there is still live and accessible, e.g. for a "detach" operation
+ * that only has a pointer to validate.
+ *
+ * @return 0 with *out_off set if ptr lies within the heap; EINVAL otherwise.
+ */
+int shm_slim_ptr_to_off(const shm_slim_region_t *region, const void *ptr,
+                        shm_off_t *out_off);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Discovery
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -348,6 +474,155 @@ int shm_slim_walk(const shm_slim_region_t *region,
  * @return 0 on success; EINVAL if region or out is NULL.
  */
 int shm_slim_pool_stats(const shm_slim_region_t *region, shm_slim_pool_stats_t *out);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Parallel lookup
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * shm_slim_lookup_by_name() and shm_slim_namespace_check() each hold the
+ * region's single process-shared mutex for the full duration of their
+ * linear scan -- correct, but it means N concurrent readers on N cores get
+ * zero actual parallelism: every lookup still serialises behind the same
+ * lock, on top of already being O(table size) per call. This mirrors v2's
+ * shm_dir_read_slot()/SHM_DIR_READ_LOCK_FREE (see shm_alloc.h) for exactly
+ * the same reason: let a fleet of readers partition a table by physical
+ * slot index and read it without contending on the mutex at all.
+ */
+
+/**
+ * Select how a parallel-lookup read synchronises with table mutations.
+ *
+ * LOCKED serialises the read with publish, free, set_key (revoke), and
+ * namespace bind/unbind/rebind -- safe under any concurrency, but no
+ * faster than shm_slim_lookup_by_name()/shm_slim_namespace_check().
+ *
+ * LOCK_FREE performs no locking at all. It is lock-free only under a
+ * QUIESCENT-TABLE CONTRACT: no process may publish, free, set_key, or
+ * touch a namespace binding on this region until every LOCK_FREE reader
+ * has finished. Violating this contract is undefined -- there is no
+ * detection of a concurrent writer. Intended for the common pattern where
+ * one process publishes everything, exits, and one or more other
+ * processes then attach purely for reading (e.g. a worker pool discovering
+ * objects a producer already finished writing).
+ */
+typedef enum shm_slim_read_mode {
+    SHM_SLIM_READ_LOCKED    = 0,
+    SHM_SLIM_READ_LOCK_FREE = 1,
+} shm_slim_read_mode_t;
+
+/**
+ * One name-table slot, as returned by shm_slim_name_read_slot(). Not
+ * permission-checked against any key -- callers still need shm_slim_ptr()
+ * for actual data access, same as shm_slim_walk()'s shm_slim_entry_t.
+ */
+typedef struct shm_slim_name_slot {
+    char      name[SHM_SLIM_NAME_MAX];  /* empty (name[0]==0) if unused */
+    shm_off_t off;                       /* payload offset; valid iff named */
+} shm_slim_name_slot_t;
+
+/**
+ * @brief Read one physical name-table slot.
+ *
+ * Lets callers partition [0, name_capacity) (see shm_slim_pool_stats())
+ * across worker threads/processes and discover named objects in parallel,
+ * instead of every reader separately racing its own full linear scan
+ * inside shm_slim_lookup_by_name().
+ *
+ * @param slot_index  Physical name-table slot in [0, name_capacity).
+ * @param mode         SHM_SLIM_READ_LOCKED or _LOCK_FREE.
+ * @return             0 with *out filled; ENOENT for an unused slot;
+ *                     ERANGE for slot_index >= name_capacity; EINVAL for
+ *                     invalid arguments/mode.
+ */
+int shm_slim_name_read_slot(const shm_slim_region_t  *region,
+                            uint32_t                  slot_index,
+                            shm_slim_read_mode_t      mode,
+                            shm_slim_name_slot_t     *out);
+
+/**
+ * @brief shm_slim_namespace_check(), with an explicit read mode.
+ *
+ * shm_slim_namespace_check() is this function called with
+ * SHM_SLIM_READ_LOCKED -- use that directly unless you are specifically
+ * building a parallel-attach path and can uphold the LOCK_FREE contract
+ * above (no concurrent bind/unbind/rebind).
+ */
+int shm_slim_namespace_check_ex(const shm_slim_region_t *region,
+                                shm_slim_key_t           key,
+                                shm_slim_read_mode_t     mode);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Key management
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Rotate a live object's access key.
+ *
+ * Requires presenting the object's CURRENT key (old_key) -- there is no
+ * separate owner identity in this engine, so holding the current key is
+ * the only proof of authorization. Does not touch any namespace binding;
+ * see shm_slim_namespace_rebind() to carry a binding forward across a
+ * rotation.
+ *
+ * @return 0 on success; EACCES if old_key does not match; EFAULT on an
+ *         out-of-range offset; EINVAL if the block is not live.
+ */
+int shm_slim_set_key(shm_slim_region_t *region, shm_off_t off,
+                     shm_slim_key_t old_key, shm_slim_key_t new_key);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Namespace binding (optional; access control is key-only by default)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * A key can optionally be confined to the Linux IPC namespace / cgroup the
+ * binding process was running in at bind time -- finer-grained than the
+ * region-wide ns_inode/cgroup_hash (which only gate opening the region at
+ * all). One namespace per key; a key with no binding is unrestricted (the
+ * default -- nothing here is required to use the rest of the engine).
+ * Binding costs one fixed-size slot per distinct KEY, never per object.
+ */
+
+/**
+ * @brief Bind a key to the calling process's current IPC namespace/cgroup.
+ *
+ * Captures shm_ns_ipc_inode()/shm_ns_cgroup_hash() at call time -- callers
+ * cannot bind a key to a namespace they are not themselves running in.
+ *
+ * @return 0 on success; EEXIST if key is already bound (unbind first to
+ *         rebind); ENOSPC if the namespace table is full.
+ */
+int shm_slim_namespace_bind(shm_slim_region_t *region, shm_slim_key_t key);
+
+/** Remove a key's namespace binding, if any. Not an error if none exists. */
+void shm_slim_namespace_unbind(shm_slim_region_t *region, shm_slim_key_t key);
+
+/**
+ * @brief Move an existing namespace binding from one key to another.
+ *
+ * Used when a key is rotated (e.g. via shm_slim_set_key()) so the
+ * namespace restriction carries forward to whoever holds the new key,
+ * rather than silently lapsing. A no-op (returns 0) if old_key has no
+ * binding. Fails rather than overwriting if new_key is already bound.
+ *
+ * @return 0 on success (including the no-op case); EEXIST if new_key
+ *         already has a distinct binding.
+ */
+int shm_slim_namespace_rebind(shm_slim_region_t *region,
+                              shm_slim_key_t old_key, shm_slim_key_t new_key);
+
+/**
+ * @brief Check whether the calling process may act as `key` here.
+ *
+ * Returns 0 (allowed) if key has no namespace binding at all -- namespaces
+ * are opt-in; plain key matching is the only check by default. If key IS
+ * bound, the caller's current ns_inode/cgroup_hash must match the bound
+ * values (a 0 in the binding for either field means that field is not
+ * checked).
+ *
+ * @return 0 if allowed; EPERM if key is bound to a namespace the caller is
+ *         not currently in.
+ */
+int shm_slim_namespace_check(const shm_slim_region_t *region, shm_slim_key_t key);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Typed C convenience macros (compile-time only -- no runtime type tag

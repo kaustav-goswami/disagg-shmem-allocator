@@ -23,7 +23,7 @@ int shm_region_open(const char                    *name_or_path,
                     const shm_region_open_opts_t   *opts,
                     shm_region_t                  **out_region)
 {
-    shm_slim_region_open_opts_t slim_opts;
+    shm_slim_region_open_opts_t slim_opts = {0};
     const shm_slim_region_open_opts_t *slim_opts_ptr = NULL;
 
     if (opts) {

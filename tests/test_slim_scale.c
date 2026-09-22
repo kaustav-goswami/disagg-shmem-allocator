@@ -81,7 +81,11 @@ static void test_empirical_overhead(void)
           "empirical total bytes/object is within the 'typical malloc' 8-32 byte ballpark");
 
     CHECK(st.name_used == 0, "name table stays empty: these are all anonymous objects");
-    CHECK(st.name_capacity == SHM_SLIM_NAME_CAP_DEFAULT,
+    /* Physical capacity is inflated 2x beyond SHM_SLIM_NAME_CAP_DEFAULT to
+     * keep the hash table's load factor low (see shm_slim_name_entry_t's
+     * comment) -- the point of this check is unaffected: it's still a
+     * fixed constant, not something that scales with n_objects. */
+    CHECK(st.name_capacity == SHM_SLIM_NAME_CAP_DEFAULT * 2,
           "name table capacity is independent of how many objects were allocated");
 
     shm_slim_region_close(r, true);

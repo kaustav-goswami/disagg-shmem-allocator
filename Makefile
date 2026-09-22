@@ -108,11 +108,15 @@ LIB_OBJS_ALL  = $(BUILD)/shm_alloc.o $(BUILD)/shm_slim.o $(BUILD)/shm_ns.o
 # etc. and the link will fail with duplicate symbols. See shm_slim_compat.c.
 LIB_OBJS_SLIM_V2COMPAT = $(BUILD)/shm_slim.o $(BUILD)/shm_slim_compat.o $(BUILD)/shm_ns.o
 
+# v0.3 formal lifecycle API (src/dmalloc.c), built on the slim engine.
+LIB_OBJS_DMALLOC = $(BUILD)/shm_slim.o $(BUILD)/dmalloc.o $(BUILD)/shm_ns.o
+
 # ── Test binaries ────────────────────────────────────────────────────────────
 TESTS = $(BUILD)/test_basic $(BUILD)/test_resize $(BUILD)/test_multihost \
         $(BUILD)/test_cap $(BUILD)/test_bounds \
         $(BUILD)/test_slim_basic $(BUILD)/test_slim_bounds $(BUILD)/test_slim_scale \
-        $(BUILD)/test_generic_backend $(BUILD)/test_slim_v2compat
+        $(BUILD)/test_generic_backend $(BUILD)/test_slim_v2compat \
+        $(BUILD)/test_slim_namespace $(BUILD)/test_dmalloc_basic
 
 .PHONY: all test clean tcmalloc-not-buildable-here ralloc-not-buildable-here
 
@@ -186,6 +190,10 @@ $(BUILD)/shm_slim.o: src/shm_slim.c include/shm_slim.h src/shm_slim_internal.h \
 $(BUILD)/shm_slim_compat.o: src/shm_slim_compat.c include/shm_slim.h | $(BUILD)
 	$(CC) $(CFLAGS) -c src/shm_slim_compat.c -o $@
 
+# v0.3 formal lifecycle API bodies.
+$(BUILD)/dmalloc.o: src/dmalloc.c include/dmalloc.h include/shm_slim.h | $(BUILD)
+	$(CC) $(CFLAGS) -c src/dmalloc.c -o $@
+
 # ── Compile and link tests ────────────────────────────────────────────────────
 $(BUILD)/test_basic: tests/test_basic.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_basic.c $(LIB_OBJS) $(LDFLAGS)
@@ -225,6 +233,15 @@ $(BUILD)/test_generic_backend: tests/test_generic_backend.c $(LIB_OBJS_ALL) | $(
 $(BUILD)/test_slim_v2compat: tests/test_slim_v2compat.c $(LIB_OBJS_SLIM_V2COMPAT) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_slim_v2compat.c $(LIB_OBJS_SLIM_V2COMPAT) $(LDFLAGS)
 
+# Optional key->namespace binding + shm_slim_set_key(); reaches into
+# src/shm_slim_internal.h to fabricate a namespace mismatch directly.
+$(BUILD)/test_slim_namespace: tests/test_slim_namespace.c src/shm_slim_internal.h $(LIB_OBJS_SLIM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/test_slim_namespace.c $(LIB_OBJS_SLIM) $(LDFLAGS)
+
+# v0.3 formal API sanity test.
+$(BUILD)/test_dmalloc_basic: tests/test_dmalloc_basic.c $(LIB_OBJS_DMALLOC) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/test_dmalloc_basic.c $(LIB_OBJS_DMALLOC) $(LDFLAGS)
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 test: all
 	@echo "─── test_basic ──────────────────"
@@ -247,6 +264,10 @@ test: all
 	./$(BUILD)/test_generic_backend
 	@echo "─── test_slim_v2compat ──────────"
 	./$(BUILD)/test_slim_v2compat
+	@echo "─── test_slim_namespace ─────────"
+	./$(BUILD)/test_slim_namespace
+	@echo "─── test_dmalloc_basic ──────────"
+	./$(BUILD)/test_dmalloc_basic
 
 # ── Remove build artifacts ────────────────────────────────────────────────────
 clean:
@@ -285,3 +306,10 @@ clean:
 	# sources memory from a library call, not shm_open), so nothing to clean.
 	-rm -f /dev/shm/shm_slim_v2compat_test
 	-rm -f /dev/shm/shm_slim_v2compat_resize
+	-rm -f /dev/shm/shm_slim_test_ns_default
+	-rm -f /dev/shm/shm_slim_test_ns_bind
+	-rm -f /dev/shm/shm_slim_test_ns_capacity
+	-rm -f /dev/shm/shm_slim_test_ns_mismatch
+	-rm -f /dev/shm/shm_slim_test_set_key
+	-rm -f /dev/shm/shm_slim_test_ns_rebind
+	-rm -f /dev/shm/dmalloc_test_basic

@@ -30,11 +30,50 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Backing-fd sizing (POSIX regular files, and DAX character devices)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+size_t shm_slim_fd_size(int fd)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        return 0;
+    if (st.st_size > 0)
+        return (size_t)st.st_size;
+
+    /* fstat() always reports st_size==0 for a /dev/dax character device --
+     * its real size lives in sysfs, keyed by the device's major:minor
+     * number (which fstat() DOES report correctly, via st_rdev, since
+     * that's just device-node identity, not size). This is the only way
+     * to recover it from just an fd: shm_slim_region_open_fd() is never
+     * given the original path string, only the fd. */
+    if (!S_ISCHR(st.st_mode))
+        return 0;
+
+    char sysfs_path[64];
+    snprintf(sysfs_path, sizeof(sysfs_path), "/sys/dev/char/%u:%u/size",
+             major(st.st_rdev), minor(st.st_rdev));
+
+    FILE *f = fopen(sysfs_path, "r");
+    if (!f)
+        return 0;
+    unsigned long long sysfs_size = 0;
+    int matched = fscanf(f, "%llu", &sysfs_size);
+    fclose(f);
+    if (matched != 1)
+        return 0;
+
+    return (size_t)sysfs_size;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Access checking
@@ -58,17 +97,90 @@ static bool key_matches(const shm_slim_hdr_t *b, shm_slim_key_t key)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Name table helpers (called under the region mutex)
+ *
+ *  Open-addressed hash table keyed by name (FNV-1a + linear probing).
+ *  `rh->name_cap` is the physical slot count, inflated ~2x beyond whatever
+ *  the caller requested so the load factor stays <= 50% -- see
+ *  shm_slim_name_entry_t's own comment and WIP.md for the measured effect.
+ *  A slot is EMPTY (name[0]==0, terminates a probe-miss), a TOMBSTONE
+ *  (name[0]==SHM_SLIM_NAME_TOMBSTONE, must be probed THROUGH, never
+ *  terminates a search), or OCCUPIED (anything else).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+static inline bool name_slot_empty(const shm_slim_name_entry_t *e)
+{
+    return e->name[0] == '\0';
+}
+
+static inline bool name_slot_tombstone(const shm_slim_name_entry_t *e)
+{
+    return e->name[0] == SHM_SLIM_NAME_TOMBSTONE;
+}
+
+static inline bool name_slot_occupied(const shm_slim_name_entry_t *e)
+{
+    return !name_slot_empty(e) && !name_slot_tombstone(e);
+}
+
+/** FNV-1a. Same algorithm shm_ns.c already uses for cgroup_hash, applied to name strings. */
+static uint32_t name_hash(const char *name)
+{
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/** Pure lookup: NULL if not found. Probes through tombstones, stops at the first empty slot. */
 static shm_slim_name_entry_t *name_find(const shm_slim_region_t *r, const char *name)
 {
     shm_slim_region_hdr_t *rh = shm_slim_rh(r);
-    for (uint32_t i = 0; i < rh->name_cap; i++) {
-        shm_slim_name_entry_t *e = shm_slim_name_slot(r, i);
-        if (e->name[0] != '\0' && strcmp(e->name, name) == 0)
+    uint32_t cap = rh->name_cap;
+    if (cap == 0) return NULL;
+    uint32_t start = name_hash(name) % cap;
+    for (uint32_t probe = 0; probe < cap; probe++) {
+        shm_slim_name_entry_t *e = shm_slim_name_slot(r, (start + probe) % cap);
+        if (name_slot_empty(e))
+            return NULL;
+        if (name_slot_occupied(e) && strcmp(e->name, name) == 0)
             return e;
     }
-    return NULL;
+    return NULL;   /* table exhausted without hitting an empty slot -- shouldn't happen at our load factor */
+}
+
+/**
+ * Combined duplicate-check + free-slot search for insertion, in ONE probe
+ * pass instead of two separate full scans -- this is the fix for the O(N)
+ * per-publish / O(N^2) total cost measured on objstream (see WIP.md).
+ * @return NULL + *out_err = EEXIST if `name` is already in use; NULL +
+ *         *out_err = ENOSPC if the table is full; otherwise the slot to
+ *         write the new entry into.
+ */
+static shm_slim_name_entry_t *name_insert_slot(const shm_slim_region_t *r, const char *name,
+                                                int *out_err)
+{
+    shm_slim_region_hdr_t *rh = shm_slim_rh(r);
+    uint32_t cap = rh->name_cap;
+    if (cap == 0) { *out_err = ENOSPC; return NULL; }
+    uint32_t start = name_hash(name) % cap;
+    shm_slim_name_entry_t *first_free = NULL;
+    for (uint32_t probe = 0; probe < cap; probe++) {
+        shm_slim_name_entry_t *e = shm_slim_name_slot(r, (start + probe) % cap);
+        if (name_slot_empty(e)) {
+            if (!first_free) first_free = e;
+            break;   /* genuine empty slot: no duplicate can exist further down this chain */
+        }
+        if (name_slot_tombstone(e)) {
+            if (!first_free) first_free = e;
+            continue;
+        }
+        if (strcmp(e->name, name) == 0) { *out_err = EEXIST; return NULL; }
+    }
+    if (!first_free) { *out_err = ENOSPC; return NULL; }
+    *out_err = 0;
+    return first_free;
 }
 
 static shm_slim_name_entry_t *name_find_by_off(const shm_slim_region_t *r, shm_off_t off)
@@ -76,18 +188,7 @@ static shm_slim_name_entry_t *name_find_by_off(const shm_slim_region_t *r, shm_o
     shm_slim_region_hdr_t *rh = shm_slim_rh(r);
     for (uint32_t i = 0; i < rh->name_cap; i++) {
         shm_slim_name_entry_t *e = shm_slim_name_slot(r, i);
-        if (e->name[0] != '\0' && e->off == off)
-            return e;
-    }
-    return NULL;
-}
-
-static shm_slim_name_entry_t *name_find_free_slot(const shm_slim_region_t *r)
-{
-    shm_slim_region_hdr_t *rh = shm_slim_rh(r);
-    for (uint32_t i = 0; i < rh->name_cap; i++) {
-        shm_slim_name_entry_t *e = shm_slim_name_slot(r, i);
-        if (e->name[0] == '\0')
+        if (name_slot_occupied(e) && e->off == off)
             return e;
     }
     return NULL;
@@ -98,18 +199,24 @@ static uint32_t name_count_used(const shm_slim_region_t *r)
     shm_slim_region_hdr_t *rh = shm_slim_rh(r);
     uint32_t n = 0;
     for (uint32_t i = 0; i < rh->name_cap; i++)
-        if (shm_slim_name_slot(r, i)->name[0] != '\0')
+        if (name_slot_occupied(shm_slim_name_slot(r, i)))
             n++;
     return n;
+}
+
+/** Mark an already-resolved entry as deleted. Tombstone, never a full
+ * clear -- zeroing would break probe chains for other entries that
+ * collided through this slot (see the type's own comment). */
+static void name_tombstone_entry(shm_slim_name_entry_t *e)
+{
+    e->name[0] = SHM_SLIM_NAME_TOMBSTONE;
+    shm_persist(e, sizeof(*e));
 }
 
 static void name_remove_by_off(shm_slim_region_t *r, shm_off_t off)
 {
     shm_slim_name_entry_t *e = name_find_by_off(r, off);
-    if (e) {
-        memset(e, 0, sizeof(*e));
-        shm_persist(e, sizeof(*e));
-    }
+    if (e) name_tombstone_entry(e);
 }
 
 static void name_update_off(shm_slim_region_t *r, shm_off_t old_off, shm_off_t new_off)
@@ -119,6 +226,42 @@ static void name_update_off(shm_slim_region_t *r, shm_off_t old_off, shm_off_t n
         e->off = new_off;
         shm_persist(e, sizeof(*e));
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Namespace table helpers (called under the region mutex)
+ *
+ *  A slot is empty iff ns_inode == 0 && cgroup_hash == 0 -- key == 0
+ *  (SHM_SLIM_KEY_OPEN) is itself a legitimate bindable key, so it cannot
+ *  double as the "unused slot" sentinel the way name_entry uses name[0].
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static bool namespace_slot_empty(const shm_slim_namespace_entry_t *e)
+{
+    return e->ns_inode == 0 && e->cgroup_hash == 0;
+}
+
+static shm_slim_namespace_entry_t *namespace_find(const shm_slim_region_t *r,
+                                                   shm_slim_key_t key)
+{
+    shm_slim_region_hdr_t *rh = shm_slim_rh(r);
+    for (uint32_t i = 0; i < rh->namespace_cap; i++) {
+        shm_slim_namespace_entry_t *e = shm_slim_namespace_slot(r, i);
+        if (!namespace_slot_empty(e) && e->key == key)
+            return e;
+    }
+    return NULL;
+}
+
+static shm_slim_namespace_entry_t *namespace_find_free_slot(const shm_slim_region_t *r)
+{
+    shm_slim_region_hdr_t *rh = shm_slim_rh(r);
+    for (uint32_t i = 0; i < rh->namespace_cap; i++) {
+        shm_slim_namespace_entry_t *e = shm_slim_namespace_slot(r, i);
+        if (namespace_slot_empty(e))
+            return e;
+    }
+    return NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -269,30 +412,53 @@ static void heap_free_block(shm_slim_region_t *r, shm_slim_hdr_t *b)
     freelist_insert(r, b);
 }
 
+/**
+ * Open addressing needs headroom to keep probe sequences short. Every
+ * caller in this codebase sizes name_capacity to exactly the number of
+ * objects it intends to publish (e.g. DMALLOC_NAME_CAPACITY == object
+ * count in objstream) -- a table sized exactly to that request would run
+ * at 100% load factor, degrading right back to the linear-scan cost
+ * hashing exists to avoid. Doubling the requested capacity keeps the load
+ * factor <= 50% for any caller. This is a real, disclosed memory cost
+ * (the physical name table is ~2x the requested size) traded for O(1)
+ * amortized publish/lookup instead of O(name_capacity) per call -- see
+ * WIP.md for the measured effect both ways.
+ */
+static uint32_t name_table_physical_capacity(uint32_t requested)
+{
+    if (requested > UINT32_MAX / 2) return UINT32_MAX;   /* saturate rather than overflow */
+    return requested * 2;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Region initialisation
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void region_init(shm_slim_region_t *r, size_t total_size,
                          shm_slim_backend_t backend, uint32_t name_cap,
-                         const char *name)
+                         uint32_t namespace_cap, const char *name)
 {
-    size_t hdr_sz   = shm_slim_align_up(sizeof(shm_slim_region_hdr_t), SHM_SLIM_ALIGN);
-    size_t name_off = hdr_sz;
-    size_t name_sz  = shm_slim_align_up((size_t)name_cap * sizeof(shm_slim_name_entry_t),
-                                         SHM_SLIM_ALIGN);
-    size_t data_off = name_off + name_sz;
+    size_t hdr_sz        = shm_slim_align_up(sizeof(shm_slim_region_hdr_t), SHM_SLIM_ALIGN);
+    size_t name_off      = hdr_sz;
+    size_t name_sz       = shm_slim_align_up((size_t)name_cap * sizeof(shm_slim_name_entry_t),
+                                              SHM_SLIM_ALIGN);
+    size_t namespace_off = name_off + name_sz;
+    size_t namespace_sz  = shm_slim_align_up((size_t)namespace_cap * sizeof(shm_slim_namespace_entry_t),
+                                              SHM_SLIM_ALIGN);
+    size_t data_off      = namespace_off + namespace_sz;
 
     memset(r->base, 0, total_size);
 
     shm_slim_region_hdr_t *rh = shm_slim_rh(r);
-    rh->magic       = SHM_SLIM_MAGIC_REGION;
-    rh->version     = SHM_SLIM_VERSION;
-    rh->backend     = (uint32_t)backend;
-    rh->name_cap    = name_cap;
-    rh->region_size = total_size;
-    rh->name_offset = name_off;
-    rh->data_offset = data_off;
+    rh->magic            = SHM_SLIM_MAGIC_REGION;
+    rh->version          = SHM_SLIM_VERSION;
+    rh->backend          = (uint32_t)backend;
+    rh->name_cap         = name_cap;
+    rh->namespace_cap    = namespace_cap;
+    rh->region_size      = total_size;
+    rh->name_offset      = name_off;
+    rh->namespace_offset = namespace_off;
+    rh->data_offset      = data_off;
     rh->used_bytes  = 0;
     rh->block_count = 0;
     rh->host_count  = 0;
@@ -352,14 +518,17 @@ int shm_slim_region_open(const char                        *name_or_path,
     if (!name_or_path || !out_region)
         return EINVAL;
 
-    shm_slim_backend_t backend  = opts ? opts->backend        : SHM_SLIM_BACKEND_POSIX;
-    uint32_t            flags    = opts ? opts->flags          : 0u;
-    uint32_t            name_cap = opts ? opts->name_capacity  : 0u;
-    mode_t               mode     = opts ? opts->mode           : 0;
-    bool                 creating = (flags & SHM_SLIM_OPEN_CREATE) != 0;
+    shm_slim_backend_t backend       = opts ? opts->backend            : SHM_SLIM_BACKEND_POSIX;
+    uint32_t            flags         = opts ? opts->flags              : 0u;
+    uint32_t            name_cap      = opts ? opts->name_capacity      : 0u;
+    uint32_t            namespace_cap = opts ? opts->namespace_capacity : 0u;
+    mode_t               mode          = opts ? opts->mode               : 0;
+    bool                 creating      = (flags & SHM_SLIM_OPEN_CREATE) != 0;
 
-    if (name_cap == 0) name_cap = SHM_SLIM_NAME_CAP_DEFAULT;
-    if (mode      == 0) mode     = 0660;
+    if (name_cap      == 0) name_cap      = SHM_SLIM_NAME_CAP_DEFAULT;
+    if (namespace_cap == 0) namespace_cap = SHM_SLIM_NAMESPACE_CAP_DEFAULT;
+    if (mode          == 0) mode          = 0660;
+    name_cap = name_table_physical_capacity(name_cap);
 
     shm_slim_region_t *reg = calloc(1, sizeof(*reg));
     if (!reg) return ENOMEM;
@@ -387,7 +556,7 @@ int shm_slim_region_open(const char                        *name_or_path,
             return ENOMEM;
         }
         reg->size = size;
-        region_init(reg, size, backend, name_cap, name_or_path);
+        region_init(reg, size, backend, name_cap, namespace_cap, name_or_path);
 
         region_lock(reg);
         shm_slim_rh(reg)->host_count++;
@@ -432,11 +601,12 @@ int shm_slim_region_open(const char                        *name_or_path,
             return err;
         }
         if (size < 4096) {
-            struct stat st;
-            if (fstat(reg->fd, &st) == 0 && st.st_size > 0)
-                size = (size_t)st.st_size;
-            else
-                size = 2u << 20;
+            /* fstat().st_size is always 0 for a /dev/dax character device
+             * (its size lives in sysfs, not the inode) -- shm_slim_fd_size()
+             * handles that; a 2MB fallback here would have silently mapped
+             * only a sliver of a real multi-GB DAX device with no warning. */
+            size_t detected = shm_slim_fd_size(reg->fd);
+            size = (detected > 0) ? detected : (2u << 20);
         }
     }
 
@@ -447,7 +617,10 @@ int shm_slim_region_open(const char                        *name_or_path,
         return EINVAL;
     }
 
-    reg->base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, reg->fd, 0);
+    reg->base = opts && opts->fixed_base
+        ? mmap(opts->fixed_base, size, PROT_READ | PROT_WRITE,
+              MAP_SHARED | MAP_FIXED_NOREPLACE, reg->fd, 0)
+        : mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, reg->fd, 0);
     if (reg->base == MAP_FAILED) {
         int err = errno;
         close(reg->fd);
@@ -460,7 +633,7 @@ int shm_slim_region_open(const char                        *name_or_path,
     shm_slim_region_hdr_t *rh = shm_slim_rh(reg);
 
     if (creating) {
-        region_init(reg, size, backend, name_cap, name_or_path);
+        region_init(reg, size, backend, name_cap, namespace_cap, name_or_path);
     } else {
         /* The version check is what makes this format incompatible with v2:
          * v2 regions store an integer version (2); this format stores the
@@ -483,6 +656,86 @@ int shm_slim_region_open(const char                        *name_or_path,
             if (my_cg != 0 && my_cg != rh->cgroup_hash) {
                 munmap(reg->base, reg->size);
                 close(reg->fd); free(reg->name); free(reg);
+                return EPERM;
+            }
+        }
+    }
+
+    region_lock(reg);
+    shm_slim_rh(reg)->host_count++;
+    shm_persist(&shm_slim_rh(reg)->host_count, sizeof(shm_slim_rh(reg)->host_count));
+    shm_drain();
+    region_unlock(reg);
+
+    *out_region = reg;
+    return 0;
+}
+
+int shm_slim_region_open_fd(int fd, uint32_t flags,
+                            const shm_slim_region_open_opts_t *opts,
+                            shm_slim_region_t                **out_region)
+{
+    if (fd < 0 || !out_region)
+        return EINVAL;
+
+    uint32_t name_cap      = opts ? opts->name_capacity      : 0u;
+    uint32_t namespace_cap = opts ? opts->namespace_capacity : 0u;
+    if (name_cap      == 0) name_cap      = SHM_SLIM_NAME_CAP_DEFAULT;
+    if (namespace_cap == 0) namespace_cap = SHM_SLIM_NAMESPACE_CAP_DEFAULT;
+    name_cap = name_table_physical_capacity(name_cap);
+
+    bool creating = (flags & SHM_SLIM_OPEN_CREATE) != 0;
+
+    /* Unlike shm_slim_region_open(), this never calls ftruncate(): the
+     * caller already opened (and, for a fresh pool, already sized) fd --
+     * "using a file descriptor" is the whole point of this entry point.
+     * The size is read back from the fd itself via shm_slim_fd_size()
+     * (handles the DAX-character-device case, where plain fstat().st_size
+     * is always 0) -- unless opts->size_hint overrides it, for device
+     * nodes where even that detection isn't reliable. */
+    size_t size = (opts && opts->size_hint) ? opts->size_hint : shm_slim_fd_size(fd);
+    if (size < 4096)
+        return EINVAL;
+
+    void *base = opts && opts->fixed_base
+        ? mmap(opts->fixed_base, size, PROT_READ | PROT_WRITE,
+              MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0)
+        : mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED)
+        return errno;
+
+    shm_slim_region_t *reg = calloc(1, sizeof(*reg));
+    if (!reg) {
+        munmap(base, size);
+        return ENOMEM;
+    }
+    reg->name    = NULL;   /* no name/path is known at this entry point */
+    reg->fd      = -1;     /* caller opened fd and keeps owning its lifecycle */
+    reg->base    = base;
+    reg->size    = size;
+    reg->creator = creating;
+    reg->backend = SHM_SLIM_BACKEND_POSIX;   /* nominal; unused for fd-based regions */
+
+    shm_slim_region_hdr_t *rh = shm_slim_rh(reg);
+
+    if (creating) {
+        region_init(reg, size, reg->backend, name_cap, namespace_cap, NULL);
+    } else {
+        if (rh->magic != SHM_SLIM_MAGIC_REGION || rh->version != SHM_SLIM_VERSION) {
+            munmap(base, size); free(reg);
+            return ENOENT;
+        }
+        if ((flags & SHM_SLIM_OPEN_ENFORCE_NS) && rh->ns_inode != 0) {
+            uint64_t my_ns = shm_ns_ipc_inode();
+            if (my_ns != 0 && my_ns != rh->ns_inode) {
+                munmap(base, size); free(reg);
+                return EPERM;
+            }
+        }
+        if ((flags & SHM_SLIM_OPEN_ENFORCE_CGROUP) && rh->cgroup_hash != 0) {
+            uint64_t my_cg = shm_ns_cgroup_hash();
+            if (my_cg != 0 && my_cg != rh->cgroup_hash) {
+                munmap(base, size); free(reg);
                 return EPERM;
             }
         }
@@ -549,6 +802,8 @@ int shm_slim_alloc(shm_slim_region_t *region,
     bool want_name = name && name[0] != '\0';
     if (want_name && strnlen(name, SHM_SLIM_NAME_MAX) >= SHM_SLIM_NAME_MAX)
         return ENAMETOOLONG;
+    if (want_name && name[0] == SHM_SLIM_NAME_TOMBSTONE)
+        return EINVAL;   /* would be indistinguishable from a deleted slot -- see SHM_SLIM_NAME_TOMBSTONE */
 
     size_t need_total = shm_slim_align_up(sizeof(shm_slim_hdr_t) + payload_size, SHM_SLIM_ALIGN);
     if (need_total < SHM_SLIM_BLOCK_MIN)
@@ -558,14 +813,11 @@ int shm_slim_alloc(shm_slim_region_t *region,
 
     shm_slim_name_entry_t *nslot = NULL;
     if (want_name) {
-        if (name_find(region, name)) {
-            region_unlock(region);
-            return EEXIST;
-        }
-        nslot = name_find_free_slot(region);
+        int err = 0;
+        nslot = name_insert_slot(region, name, &err);
         if (!nslot) {
             region_unlock(region);
-            return ENOSPC;
+            return err;
         }
     }
 
@@ -631,6 +883,39 @@ int shm_slim_free(shm_slim_region_t *region, shm_off_t off, shm_slim_key_t key)
     heap_free_block(region, b);
     shm_drain();
 
+    region_unlock(region);
+    return 0;
+}
+
+int shm_slim_free_by_name(shm_slim_region_t *region, const char *name,
+                          shm_slim_key_t key, shm_off_t *out_off)
+{
+    if (!region || !name) return EINVAL;
+
+    region_lock(region);
+
+    shm_slim_name_entry_t *e = name_find(region, name);
+    if (!e) {
+        region_unlock(region);
+        return ENOENT;
+    }
+
+    shm_slim_hdr_t *b = shm_slim_blk_of_poff_checked(region, e->off);
+    if (!blk_is_live(b)) {
+        region_unlock(region);
+        return EFAULT;   /* name table entry is stale/corrupted */
+    }
+    if (!key_matches(b, key)) {
+        region_unlock(region);
+        return EACCES;
+    }
+
+    shm_off_t off = e->off;
+    name_tombstone_entry(e);
+    heap_free_block(region, b);
+    shm_drain();
+
+    if (out_off) *out_off = off;
     region_unlock(region);
     return 0;
 }
@@ -792,6 +1077,157 @@ int shm_slim_block_size(const shm_slim_region_t *region,
     return 0;
 }
 
+int shm_slim_ptr_to_off(const shm_slim_region_t *region, const void *ptr,
+                        shm_off_t *out_off)
+{
+    if (!region || !ptr || !out_off) return EINVAL;
+
+    const char *heap_base = shm_slim_heap_base(region);
+    size_t      heap_size = shm_slim_heap_size(region);
+    const char *p         = (const char *)ptr;
+
+    if (p < heap_base || (size_t)(p - heap_base) >= heap_size)
+        return EINVAL;
+
+    *out_off = (shm_off_t)(p - heap_base);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Public API: key management
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int shm_slim_set_key(shm_slim_region_t *region, shm_off_t off,
+                     shm_slim_key_t old_key, shm_slim_key_t new_key)
+{
+    if (!region) return EINVAL;
+
+    region_lock(region);
+
+    shm_slim_hdr_t *b = shm_slim_blk_of_poff_checked(region, off);
+    if (!blk_is_live(b)) {
+        region_unlock(region);
+        return EINVAL;
+    }
+    if (!key_matches(b, old_key)) {
+        region_unlock(region);
+        return EACCES;
+    }
+
+    b->key = new_key;
+    shm_persist(b, sizeof(*b));
+    shm_drain();
+
+    region_unlock(region);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Public API: namespace binding
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int shm_slim_namespace_bind(shm_slim_region_t *region, shm_slim_key_t key)
+{
+    if (!region) return EINVAL;
+
+    region_lock(region);
+
+    if (namespace_find(region, key)) {
+        region_unlock(region);
+        return EEXIST;
+    }
+    shm_slim_namespace_entry_t *slot = namespace_find_free_slot(region);
+    if (!slot) {
+        region_unlock(region);
+        return ENOSPC;
+    }
+
+    uint64_t ns_inode    = shm_ns_ipc_inode();
+    uint64_t cgroup_hash = shm_ns_cgroup_hash();
+    if (ns_inode == 0 && cgroup_hash == 0) {
+        /* Nothing to bind to on this host -- refuse rather than silently
+         * create an entry that namespace_slot_empty() would treat as free. */
+        region_unlock(region);
+        return ENOTSUP;
+    }
+
+    slot->key         = key;
+    slot->ns_inode    = ns_inode;
+    slot->cgroup_hash = cgroup_hash;
+    shm_persist(slot, sizeof(*slot));
+    shm_drain();
+
+    region_unlock(region);
+    return 0;
+}
+
+void shm_slim_namespace_unbind(shm_slim_region_t *region, shm_slim_key_t key)
+{
+    if (!region) return;
+
+    region_lock(region);
+    shm_slim_namespace_entry_t *e = namespace_find(region, key);
+    if (e) {
+        memset(e, 0, sizeof(*e));
+        shm_persist(e, sizeof(*e));
+        shm_drain();
+    }
+    region_unlock(region);
+}
+
+int shm_slim_namespace_rebind(shm_slim_region_t *region,
+                              shm_slim_key_t old_key, shm_slim_key_t new_key)
+{
+    if (!region) return EINVAL;
+
+    region_lock(region);
+
+    shm_slim_namespace_entry_t *e = namespace_find(region, old_key);
+    if (!e) {
+        region_unlock(region);
+        return 0;   /* nothing bound; not an error */
+    }
+    if (old_key != new_key && namespace_find(region, new_key)) {
+        region_unlock(region);
+        return EEXIST;
+    }
+
+    e->key = new_key;
+    shm_persist(e, sizeof(*e));
+    shm_drain();
+
+    region_unlock(region);
+    return 0;
+}
+
+int shm_slim_namespace_check_ex(const shm_slim_region_t *region, shm_slim_key_t key,
+                                shm_slim_read_mode_t mode)
+{
+    if (!region) return EINVAL;
+    if (mode != SHM_SLIM_READ_LOCKED && mode != SHM_SLIM_READ_LOCK_FREE)
+        return EINVAL;
+
+    shm_slim_region_t *mr = (shm_slim_region_t *)region;
+    if (mode == SHM_SLIM_READ_LOCKED) region_lock(mr);
+
+    const shm_slim_namespace_entry_t *e = namespace_find(region, key);
+    int result = 0;
+    if (e) {
+        if (e->ns_inode != 0 && e->ns_inode != shm_ns_ipc_inode())
+            result = EPERM;
+        else if (e->cgroup_hash != 0 && e->cgroup_hash != shm_ns_cgroup_hash())
+            result = EPERM;
+    }
+
+    if (mode == SHM_SLIM_READ_LOCKED) region_unlock(mr);
+    return result;
+}
+
+int shm_slim_namespace_check(const shm_slim_region_t *region, shm_slim_key_t key)
+{
+    return shm_slim_namespace_check_ex(region, key, SHM_SLIM_READ_LOCKED);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Public API: discovery
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -825,6 +1261,31 @@ int shm_slim_lookup_by_name(const shm_slim_region_t *region,
     *out_off = e->off;
     region_unlock(mr);
     return 0;
+}
+
+int shm_slim_name_read_slot(const shm_slim_region_t *region, uint32_t slot_index,
+                            shm_slim_read_mode_t mode, shm_slim_name_slot_t *out)
+{
+    if (!region || !out) return EINVAL;
+    if (mode != SHM_SLIM_READ_LOCKED && mode != SHM_SLIM_READ_LOCK_FREE)
+        return EINVAL;
+
+    shm_slim_region_hdr_t *rh = shm_slim_rh((shm_slim_region_t *)region);
+    if (slot_index >= rh->name_cap) return ERANGE;
+
+    shm_slim_region_t *mr = (shm_slim_region_t *)region;
+    if (mode == SHM_SLIM_READ_LOCKED) region_lock(mr);
+
+    shm_slim_name_entry_t *e = shm_slim_name_slot(region, slot_index);
+    bool occupied = name_slot_occupied(e);   /* excludes both empty and tombstone slots */
+    if (occupied) {
+        strncpy(out->name, e->name, SHM_SLIM_NAME_MAX - 1);
+        out->name[SHM_SLIM_NAME_MAX - 1] = '\0';
+        out->off = e->off;
+    }
+
+    if (mode == SHM_SLIM_READ_LOCKED) region_unlock(mr);
+    return occupied ? 0 : ENOENT;
 }
 
 int shm_slim_walk(const shm_slim_region_t *region, uint64_t *cursor, shm_slim_entry_t *out)

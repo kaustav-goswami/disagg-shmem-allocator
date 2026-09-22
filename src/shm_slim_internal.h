@@ -59,29 +59,74 @@ typedef struct shm_slim_region_hdr {
     uint32_t        magic;         /* SHM_SLIM_MAGIC_REGION ("SHMA") */
     uint32_t        version;       /* SHM_SLIM_VERSION ("slim") */
     uint32_t        backend;       /* shm_slim_backend_t cast to uint32 */
-    uint32_t        name_cap;      /* capacity of the name table */
+    uint32_t        name_cap;      /* PHYSICAL capacity of the name table (hash table array size; see shm_slim_name_entry_t) */
     pthread_mutex_t mutex;         /* process-shared robust mutex */
     uint32_t        host_count;    /* attached processes */
-    uint32_t        _pad0;
+    uint32_t        namespace_cap; /* capacity of the key->namespace table */
     size_t          region_size;   /* total mapping size in bytes */
     size_t          name_offset;   /* byte offset of the name table */
+    size_t          namespace_offset; /* byte offset of the key->namespace table */
     size_t          data_offset;   /* byte offset of the heap */
     uint64_t        free_list;     /* 1-based hoff -> first free block */
     size_t          used_bytes;    /* bytes committed to live blocks */
     size_t          block_count;   /* live block count */
-    uint64_t        ns_inode;      /* IPC namespace inode of creator */
-    uint64_t        cgroup_hash;   /* FNV-1a hash of creator's cgroup */
+    uint64_t        ns_inode;      /* IPC namespace inode of creator (region-wide) */
+    uint64_t        cgroup_hash;   /* FNV-1a hash of creator's cgroup (region-wide) */
     char            shm_name[64];  /* the name/path used at creation */
 } shm_slim_region_hdr_t;
 
 /**
  * Name table entry -- one per named object. Sized to how many objects the
  * application actually wants to name, not to the total object count.
+ *
+ * Open-addressed hash table (FNV-1a of the name, linear probing) as of
+ * the parallel-lookup/hash-index work -- see WIP.md. `name_cap` in the
+ * region header is the PHYSICAL slot count (inflated ~2x beyond whatever
+ * capacity the caller requested, to keep the load factor <= 50% and
+ * probe sequences short); `shm_slim_pool_stats()`/`d_name_capacity()`
+ * report this physical count, since that's the range a slot-based scan
+ * (`shm_slim_name_read_slot()` / `d_attach_slot()`) actually needs to
+ * cover.
  */
 typedef struct shm_slim_name_entry {
     char      name[SHM_SLIM_NAME_MAX];  /* NUL-padded; name[0]==0 -> empty */
     shm_off_t off;                       /* payload offset of the object */
 } shm_slim_name_entry_t;
+
+/**
+ * Sentinel marking a deleted ("tombstone") name-table slot -- distinct
+ * from both a genuinely-never-used slot (name[0]==0, which safely
+ * terminates a probe-miss) and a live entry (any other first byte).
+ * Open-addressing probe sequences must continue THROUGH a tombstone
+ * rather than stopping at it, or entries placed further down the same
+ * probe chain would become permanently unreachable. A non-printable
+ * control byte that no name published through the public API can begin
+ * with in practice (every name in this codebase is NUL-terminated ASCII
+ * from snprintf) -- shm_slim_alloc() rejects any caller-supplied name
+ * that actually begins with this byte outright (EINVAL), rather than
+ * leaving it as an unenforced assumption that could silently corrupt the
+ * table's probe-chain invariants.
+ */
+#define SHM_SLIM_NAME_TOMBSTONE ((char)0x01)
+
+/**
+ * Key -> namespace binding. Optional and separate from every object: an
+ * access key can be confined to a specific Linux IPC namespace / cgroup
+ * (finer-grained than the region-wide ns_inode/cgroup_hash above, which
+ * only gate opening the region at all). Sized to how many distinct keys a
+ * deployment actually binds, never to the object count -- binding a key
+ * costs one 24-byte slot here regardless of how many objects use that key.
+ *
+ * A slot is empty iff ns_inode == 0 && cgroup_hash == 0 (key == 0 is
+ * SHM_SLIM_KEY_OPEN, itself a legitimate bindable key, so it cannot double
+ * as the "unused slot" sentinel).
+ */
+typedef struct shm_slim_namespace_entry {
+    uint32_t key;          /* shm_slim_key_t this entry restricts */
+    uint32_t _pad;
+    uint64_t ns_inode;     /* required IPC namespace inode; 0 = not checked */
+    uint64_t cgroup_hash;  /* required cgroup fingerprint; 0 = not checked */
+} shm_slim_namespace_entry_t;
 
 /** Per-process region handle. Not visible to other host processes. */
 struct shm_slim_region {
@@ -113,6 +158,16 @@ static inline shm_slim_name_entry_t *shm_slim_name_base(const shm_slim_region_t 
 static inline shm_slim_name_entry_t *shm_slim_name_slot(const shm_slim_region_t *r, uint32_t idx)
 {
     return &shm_slim_name_base(r)[idx];
+}
+
+static inline shm_slim_namespace_entry_t *shm_slim_namespace_base(const shm_slim_region_t *r)
+{
+    return (shm_slim_namespace_entry_t *)((char *)r->base + shm_slim_rh(r)->namespace_offset);
+}
+
+static inline shm_slim_namespace_entry_t *shm_slim_namespace_slot(const shm_slim_region_t *r, uint32_t idx)
+{
+    return &shm_slim_namespace_base(r)[idx];
 }
 
 static inline char *shm_slim_heap_base(const shm_slim_region_t *r)

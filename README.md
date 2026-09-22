@@ -18,14 +18,20 @@ A C11 / C++17 allocator for **POSIX shared memory** and **DAX / CXL disaggregate
 - C++ typed wrappers with placement new, `static_cast`, and `dynamic_cast`
 - A **v0.2 "slim" format** with 16 bytes of metadata per object instead of
   152 — API-compatible with the above by swapping one `#include`
+- A **v0.3 lifecycle API** (`dmalloc.h` / `libdmalloc`) — eight
+  human-readable-name-first primitives (`d_init`, `d_publish`, `d_lookup`,
+  `d_attach`, `d_detach`, `d_revoke`, `d_delete`, `d_deinit`) built on the
+  same slim engine, plus per-key **namespace confinement** and **lock-free
+  parallel discovery** for high object counts
 
 Parts of this program is vibe coded.
 
 ---
 
-## Two formats: v2 and v0.2 "slim"
+## Three formats: v2, v0.2 "slim", and v0.3 (`dmalloc.h`)
 
-This repository now ships **two independent, mutually incompatible formats**:
+This repository now ships **three formats**, two of them sharing one
+on-disk engine:
 
 - **v2** (everything below, through [File structure](#file-structure)) — the
   original, full-featured format: object directory, monotonic IDs, owner +
@@ -37,12 +43,25 @@ This repository now ships **two independent, mutually incompatible formats**:
   object counts. 16 bytes of metadata per anonymous object. See that section
   for the full design and [WIP.md](WIP.md) for the rationale and every
   decision made along the way.
+- **[v0.3](#v03--the-dmalloclh-lifecycle-api)** — a name-first *lifecycle*
+  API (`d_init`/`d_publish`/`d_lookup`/`d_attach`/`d_detach`/`d_revoke`/
+  `d_delete`/`d_deinit`) layered directly on top of the **same v0.2 slim
+  on-disk engine** — same 16-byte block header, same region format, zero
+  additional per-object metadata. It replaces v2's owner+permission-bitmask
+  access control with a single capability-style key, and adds two features
+  the slim engine gained *after* v0.2 first shipped: a per-key namespace
+  table and a lock-free slot-based attach path for parallelizing discovery
+  across many named objects.
 
-They are separate modules (`shm_alloc.*` / `shm_cap.*` vs. `shm_slim.*`) that
-can be built and used independently, or together in the same program (no
-symbol or type collisions). Neither can open a region created by the other —
-see [Incompatibility with v2](#incompatibility-with-v2) for how that's
-enforced.
+v2 and v0.2/v0.3 are separate modules (`shm_alloc.*` / `shm_cap.*` vs.
+`shm_slim.*` / `dmalloc.*`) that can be built and used independently, or
+together in the same program (no symbol or type collisions). Neither format
+family can open a region created by the other — see
+[Incompatibility with v2](#incompatibility-with-v2) for how that's enforced.
+v0.2 and v0.3 **do** interoperate: they are two different API surfaces over
+literally the same on-disk region, so a region created through
+`shm_slim_region_open()` can be attached to through `d_init()` and vice
+versa.
 
 ---
 
@@ -1070,6 +1089,421 @@ the metadata-size problem in the first place.
 
 ---
 
+## v0.3 — the `dmalloc.h` lifecycle API
+
+### Why
+
+v0.2 fixed the *metadata-size* problem (152 B → 16 B per object) but left
+access control, discovery, and cross-host lifecycle management as a loose
+grab-bag of individually-named functions (`shm_slim_alloc`,
+`shm_slim_lookup_by_name`, `shm_slim_ptr`, ...). v0.3 does not touch the
+on-disk format again — it is the **same 16-byte block header, the same
+region**, opened by a call to `shm_slim_region_open_fd()` under the hood —
+it instead collapses the whole lifecycle into eight primitives with a
+single, consistent shape: *initialize, publish, look up, attach, detach,
+revoke, delete, deinitialize*. Two extensions were added to the shared
+engine specifically to support this API: a **per-key namespace table**
+(finer-grained than the region-wide namespace/cgroup enforcement v0.2
+already had) and a **lock-free, slot-based attach path** for parallelizing
+discovery once a table holds many named objects. Both extensions benefit
+v0.2 callers too, since they live in the shared engine, not in `dmalloc.c`
+itself.
+
+Full design rationale — every resolved deviation from the source
+primitive table, every bug found while building this, and the exact
+before/after numbers for the parallel-attach work — is in
+[WIP.md](WIP.md).
+
+### The eight primitives, at a glance
+
+| Primitive | Signature | What it does |
+|---|---|---|
+| Initialize | `handle_t *d_init(int fd, flags_t flag, uint32_t key)` | Maps `fd` once; `D_CREATE` initializes a fresh region, otherwise attaches to an existing one. Returns an opaque handle carrying the region plus this caller's identity (`key`). |
+| Publish | `bool d_publish(handle_t *h, const char *name, void *obj, size_t size, uint32_t key)` | Allocates `size` bytes, copies `obj` into them, and registers the object under `name` — one atomic step, not "reserve then fill." |
+| Lookup | `bool d_lookup(handle_t *h, const char *name, flags_t flag)` | Discovery only: true if `name` exists and `h`'s key grants access. Never maps anything. |
+| Attach | `void *d_attach(handle_t *h, const char *name, flags_t flag)` | Resolves `name` to a pointer inside `h`'s already-mapped region. `NULL` on missing name, wrong key, or a namespace violation. |
+| Detach | `bool d_detach(handle_t *h, void *ptr)` | Logical unmap: validates `ptr` belongs to `h`'s region and is still live. |
+| Revoke | `bool d_revoke(handle_t *h, const char *name, int host_id, uint32_t new_key)` | Rotates the object's key. Every holder of the *old* key loses access on their next call — lazily, with no active push to other hosts. |
+| Delete | `int d_delete(handle_t *h, const char *name, uint32_t key)` | Frees the object, tombstones its name-table slot, and releases any namespace binding on that key. |
+| Deinitialize | `void d_deinit(handle_t *h)` | Tears down *this handle's* mapping only. Never touches the region's contents — other attached hosts are unaffected. |
+
+Three more calls exist beyond this literal table, added where the table's
+shape genuinely didn't fit a real requirement (see WIP.md for the
+justification of each): `d_handle_key(h)` (read back the identity a
+handle is acting as), `d_namespace_bind(h, key)` (see below), and the
+`d_attach_slot`/`d_name_capacity` pair (see [Lock-free parallel
+discovery](#lock-free-parallel-discovery-with-d_attach_slot)).
+
+### Control path vs. data path
+
+```
+                      CONTROL PATH (name resolution, once)         DATA PATH (LD/ST, every access)
+                      ───────────────────────────────────         ────────────────────────────────
+ host A                                                     host A
+ ┌─────────────┐  d_publish("w", buf, N, key)   ┌────────┐  ptr[i] = 3.14;
+ │ application │ ─────────────────────────────▶ │ region │ ◀──────────────────  direct memory
+ └─────────────┘                                 │ header │                     write, no
+                                                  │ name   │                     allocator call
+ host B                                          │ table  │  host B             in the loop
+ ┌─────────────┐  ptr = d_attach("w", 0)         │ heap   │
+ │ application │ ─────────────────────────────▶ │ blocks │ ─────────────────▶  double x = ptr[i];
+ └─────────────┘                                 └────────┘                     direct memory read
+```
+
+`d_publish`/`d_attach`/`d_lookup`/`d_revoke`/`d_delete` are the *only*
+calls that touch the name table or take the region mutex. Once a pointer
+comes back from `d_attach`, every subsequent read or write is an ordinary
+load/store — the library is completely out of the critical path, by
+construction (this is the same split the STREAM/`objstream` benchmarks in
+[`test-prog/stream-namebound/`](test-prog/stream-namebound/) measure
+directly).
+
+### Memory layout, updated: four zones, not three
+
+The v0.3-era engine (shared with v0.2) has **four** zones, not three — a
+namespace table was added between the name table and the heap after v0.2
+first shipped (the [v0.2 memory layout](#memory-layout) diagram above
+predates it):
+
+```
+base[0]        +name_offset      +namespace_offset      +data_offset
+  │                  │                    │                    │
+  ▼                  ▼                    ▼                    ▼
+┌──────────────┬─────────────────┬──────────────────────┬─────────────────────┐
+│ region header│ name table       │ namespace table       │ heap                │
+│   200 B      │ name_cap × 32 B  │ namespace_cap × 24 B  │ (16-byte-header     │
+│              │ (hash-indexed)   │ (one slot per BOUND   │  blocks, implicit   │
+│              │                  │  key, not per object) │  list)              │
+└──────────────┴─────────────────┴──────────────────────┴─────────────────────┘
+```
+
+All four offsets (`name_offset`, `namespace_offset`, `data_offset`) are
+computed once at creation and stored in the region header, so any process
+that opens the region can find every zone from the header alone —
+identical philosophy to v2's `dir_offset`/`data_offset` pair.
+
+### Struct: the region header — `shm_slim_region_hdr_t` (200 bytes total)
+
+Verified with `sizeof`/`offsetof`, not estimated — same rigor as the v2
+region-header table above. It is, by coincidence, also exactly 200 bytes.
+
+```c
+typedef struct shm_slim_region_hdr {
+    uint32_t        magic;             /* SHM_SLIM_MAGIC_REGION ("SHMA") */
+    uint32_t        version;           /* SHM_SLIM_VERSION ("slim"), not v2's integer */
+    uint32_t        backend;           /* shm_slim_backend_t: POSIX / DAX / generic-allocator */
+    uint32_t        name_cap;          /* PHYSICAL name-table capacity (hash array size) */
+    pthread_mutex_t mutex;             /* process-shared robust mutex, 40 B on glibc x86-64 */
+    uint32_t        host_count;        /* attached processes */
+    uint32_t        namespace_cap;     /* capacity of the key -> namespace table */
+    size_t          region_size;       /* total mapping size in bytes */
+    size_t          name_offset;       /* byte offset of the name table */
+    size_t          namespace_offset;  /* byte offset of the key -> namespace table */
+    size_t          data_offset;       /* byte offset of the heap */
+    uint64_t        free_list;         /* 1-based hoff -> first free block */
+    size_t          used_bytes;        /* bytes committed to live blocks */
+    size_t          block_count;       /* live block count */
+    uint64_t        ns_inode;          /* IPC namespace inode of creator (region-wide) */
+    uint64_t        cgroup_hash;       /* FNV-1a hash of creator's cgroup (region-wide) */
+    char            shm_name[64];      /* the name/path used at creation */
+} shm_slim_region_hdr_t;               /* sizeof == 200, verified */
+```
+
+```
+ Offset  Size  Field
+──────────────────────────────────────────────────────────────────────────
+   +0      4   magic              0x53484D41 ("SHMA") — shared with v2
+   +4      4   version            "slim" (0x736C696D) — never collides with v2's integer
+   +8      4   backend            0=POSIX shm_open, 1=DAX, 2=generic-allocator (SHM_SLIM_BACKEND_*)
+                                  nominal/unused when opened via d_init()'s fd-based
+                                  path (d_init() never sets this field itself — it
+                                  always passes through to shm_slim_region_open_fd(),
+                                  which hardcodes SHM_SLIM_BACKEND_POSIX here regardless
+                                  of what the fd actually backs, whether that's real
+                                  POSIX shm, a plain file, or a DAX device)
+  +12      4   name_cap           physical name-table slot count
+  +16     40   mutex              process-shared robust pthread_mutex_t
+  +56      4   host_count         attached processes                        ◀ SECURITY-adjacent
+  +60      4   namespace_cap      key -> namespace table capacity
+  +64      8   region_size        total mapping size
+  +72      8   name_offset        byte offset of the name table
+  +80      8   namespace_offset   byte offset of the namespace table
+  +88      8   data_offset        byte offset of the heap
+  +96      8   free_list          1-based heap-offset link, 0 = empty
+ +104      8   used_bytes         live-block byte accounting
+ +112      8   block_count        live-block count
+ +120      8   ns_inode           creator's IPC-namespace inode              ◀ SECURITY
+ +128      8   cgroup_hash        FNV-1a hash of creator's cgroup path       ◀ SECURITY
+ +136     64   shm_name           name/path used at creation
+                                                              total: 200 B
+```
+
+This header is **O(1) per region regardless of object count** — the same
+design invariant v0.2 established. Every field above exists exactly once
+per region, never once per object.
+
+### Struct: the 16-byte block header — unchanged from v0.2
+
+```c
+typedef struct shm_slim_hdr {
+    uint32_t magic;   /* SHM_SLIM_MAGIC_LIVE / _LIVE_NAMED / _FREE */
+    uint32_t key;     /* access-control key; 0 = SHM_SLIM_KEY_OPEN (no check) */
+    uint64_t size;    /* total block size (header + payload), 8-byte aligned */
+} shm_slim_hdr_t;     /* sizeof == 16, enforced by _Static_assert */
+```
+
+```
+┌──────────────┬──────────────┬──────────────────────┬───────────────···
+│ magic (4 B)  │  key (4 B)   │      size (8 B)       │  payload (size-16 B)
+└──────────────┴──────────────┴──────────────────────┴───────────────···
+  live/free/         d_publish's         total block            what d_attach
+  named tag         5th argument         incl. header             returns a
+                                                                  pointer into
+```
+
+Every object v0.3 publishes — named or anonymous — pays exactly this and
+nothing more. See [v0.2's block header section](#the-16-byte-block-header)
+for the full free-list-overlay and reverse-lookup rationale, which v0.3
+inherits unchanged.
+
+### Struct: the name table — now hash-indexed
+
+```c
+typedef struct shm_slim_name_entry {
+    char      name[24];  /* NUL-padded; name[0]==0 -> empty; name[0]=='\x01' -> tombstone */
+    shm_off_t off;        /* payload offset of the object */
+} shm_slim_name_entry_t;   /* 32 bytes/slot */
+```
+
+v0.2 originally scanned this table linearly. The v0.3 work load-tested
+that at high object counts (the STREAM-array-decoupling stress test in
+Figure 5-style benchmarks under `test-prog/stream-namebound/`) and
+open-addressed it: each slot is placed by an FNV-1a hash of its name with
+linear probing, and the table's **physical** capacity — what
+`d_name_capacity()` reports — is silently doubled beyond whatever capacity
+the caller requested, keeping the load factor at or below 50% so probe
+chains stay short regardless of naming pressure.
+
+```
+requested capacity: 8            physical capacity: 16  (2x, load factor <= 50%)
+
+slot:   0     1     2     3     4     5     6     7     8     9    10  ...  15
+       ┌───┬─────┬───┬─────┬───┬─────┬─────┬───┬─────┬───┬─────┬───┬─────┐
+       │ · │ "w" │ · │ TS  │ · │ "b" │ "c" │ · │ · │ "a" │ · │ · │ · │
+       └───┴─────┴───┴─────┴───┴─────┴─────┴───┴───┴─────┴───┴───┴─────┘
+        empty  live  empty tomb- empty  live  live  empty      live
+                            stone (deleted,
+                                   probes
+                                   through it)
+```
+
+A tombstone (`name[0] == '\x01'`, disjoint from both an empty slot's `0`
+and any valid ASCII name byte) is written on delete instead of clearing
+the slot outright — clearing it would break the probe chain for any
+still-live entry that hashed to the same slot and got linearly probed past
+it. The 24-byte name field is a **hard cutoff**: `d_publish`/`shm_slim_alloc`
+reject (`ENAMETOOLONG`), not truncate, any name at or beyond 24 characters
+(23 usable + NUL) — this surfaced directly while integrating a PyTorch
+shared-weight loader, whose `state_dict` keys routinely exceed it; see
+[WIP.md](WIP.md) for the deterministic short-alias workaround used there.
+
+### Struct: the namespace table — new in v0.3
+
+```c
+typedef struct shm_slim_namespace_entry {
+    uint32_t key;          /* the shm_slim_key_t this entry restricts */
+    uint32_t _pad;
+    uint64_t ns_inode;     /* required IPC namespace inode; 0 = not checked */
+    uint64_t cgroup_hash;  /* required cgroup fingerprint; 0 = not checked */
+} shm_slim_namespace_entry_t;   /* 24 bytes/slot */
+```
+
+```
+┌────────────┬────────────┬────────────────────────┬────────────────────────┐
+│ key (4 B)  │ pad (4 B)  │     ns_inode (8 B)      │    cgroup_hash (8 B)   │
+└────────────┴────────────┴────────────────────────┴────────────────────────┘
+```
+
+This is the mechanism behind `d_namespace_bind(handle, key)`. Crucially,
+it is **one entry per distinct key, not per object** — a workload that
+publishes ten thousand anonymous objects under one shared key and binds
+that key pays for exactly one 24-byte slot, not ten thousand. Region-wide
+namespace/cgroup enforcement (`D_ENFORCE_NS`/`D_ENFORCE_CGROUP` at
+`d_init` time, using the region header's `ns_inode`/`cgroup_hash` fields
+above) still exists unchanged from v0.2 and gates *opening the region at
+all*; this table is strictly finer-grained — it can additionally confine
+one specific key inside an otherwise-open region. A handle may only bind
+its **own** key (`d_namespace_bind(h, d_handle_key(h))`) — there is no
+privileged call that binds a key on another principal's behalf — and the
+binding is checked in exactly one place, `d_attach`, right after the
+ordinary key match succeeds, so a deployment that never calls this pays
+nothing for it anywhere else.
+
+### Struct: `handle_t` — what `d_init` actually returns
+
+```c
+struct handle {
+    shm_slim_region_t *region;  /* the mapped region (opaque, from v0.2's engine) */
+    uint32_t            key;    /* this handle's own identity, fixed at d_init() */
+};   /* opaque outside dmalloc.c -- callers only ever hold a handle_t * */
+      /* sizeof == 16 (8-byte pointer + 4-byte key, padded to 8-byte align) */
+```
+
+```
+        handle_t
+      ┌──────────────────────┐
+      │ region ───────────▶  │──▶  the mapped v0.2-format region (header/name/namespace/heap)
+      │ key = 0xCAFE         │      every d_attach/d_publish/... on this handle
+      └──────────────────────┘      acts as this identity unless a call takes
+                                     an explicit key argument to override it
+```
+
+A handle is deliberately thin: everything that must be *shared* across
+hosts (the region's contents, the name table, the namespace bindings)
+lives in the mapped region; everything that is *per-process* (which
+identity this call site acts as) lives in this 16-byte struct, private to
+one process and never itself shared.
+
+### Fixed-address attachment for pointer-heavy legacy code
+
+`d_attach` is a *logical* operation — `d_init()` maps the entire region
+once, and every `d_attach` resolves a name to a pointer inside that
+existing mapping rather than issuing a fresh `mmap` per object. That
+means the only point at which a region's virtual address can be pinned is
+`d_init()` itself, via the `DMALLOC_FIXED_BASE` environment variable (a
+hex address):
+
+```
+        host A (creator)                    host B (attacher)
+   DMALLOC_FIXED_BASE=0x700000000000   DMALLOC_FIXED_BASE=0x700000000000
+        │                                      │
+        ▼ d_init(fd, D_CREATE, key)            ▼ d_init(fd, 0, key)
+   mmap(0x700000000000, ..., MAP_FIXED_NOREPLACE, fd, 0)
+        │                                      │
+        ▼                                      ▼
+   region mapped at                       region mapped at
+   0x700000000000                         0x700000000000   ◀── identical
+        │                                      │
+        ▼ d_attach(h, "cache_entry", 0)        ▼ d_attach(h, "cache_entry", 0)
+   returns 0x700000010af8                 returns 0x700000010af8   ◀── identical
+```
+
+Once every participating host opts in, a pointer embedded *inside* a
+shared object (not just the object's own address) — e.g. a linked
+structure's internal `next` pointer — remains dereferenceable on every
+host, which offset-based design normally avoids needing at all but which
+pointer-heavy legacy C code (a disaggregated Memcached's internal slab
+pointers, in this repository's own `test-prog/memcached/demalloc/`) may
+require unmodified. `MAP_FIXED_NOREPLACE` is used rather than `MAP_FIXED`
+specifically so a colliding reservation fails loudly (`EEXIST`) instead of
+silently unmapping whatever else a host had already placed there.
+
+### Lock-free parallel discovery with `d_attach_slot`
+
+A serial `d_attach` loop over many named objects holds the region's one
+mutex for every single hash-table probe — no parallelism, even though
+attach is logically read-only. `d_name_capacity()` exposes the name
+table's *physical* slot count to partition, and `d_attach_slot()` reads
+one physical slot directly by index, entirely without the mutex:
+
+```
+                    d_name_capacity(h) = 64 physical slots
+        ┌─────────────────────────────────────────────────────────┐
+        │  0    8    16   24   32   40   48   56           63     │
+        └──┬────┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──┬─┴──────────────┘
+           │        │      │      │      │      │
+           ▼        ▼      ▼      ▼      ▼      ▼
+        thread0  thread1 thread2 thread3 thread4 thread5
+        d_attach_slot(h, 0..7, ...)  ...  each partition scanned
+        lock-free, no shared mutex acquired by any thread
+```
+
+This is safe **only** under an explicit quiescent-table contract — no
+other host may be concurrently calling `d_publish`/`d_delete`/`d_revoke`/
+`d_namespace_bind` against the same region while a lock-free scan is in
+flight; violating this is undefined behavior, with no detection. It
+targets specifically the "one process finishes publishing, a worker pool
+then attaches to read" pattern (model-weight loading, read-mostly table
+sharing) — `d_attach` remains the safe-under-any-concurrency default.
+`test-prog/stream-namebound/objstream_run.cpp` parallelizes its discovery
+loop with OpenMP over exactly this pair; see [WIP.md](WIP.md) for the
+measured before/after.
+
+### Configuration via environment variables
+
+`d_init(fd, flag, key)`'s three-argument signature (fixed by the source
+primitive table this API implements) leaves no room for the extra,
+occasionally-needed knobs below — they are read from the environment
+instead, once, inside `d_init()`:
+
+| Variable | Effect | Default if unset |
+|---|---|---|
+| `DMALLOC_NAME_CAPACITY` | Requested (pre-doubling) name-table capacity | 64 |
+| `DMALLOC_NAMESPACE_CAPACITY` | Namespace-binding table capacity | 64 |
+| `DMALLOC_REGION_SIZE` | Explicit region size — required when `fd`'s size can't be auto-detected (e.g. some `/dev/dax`/`/dev/cxl` nodes report 0 via `fstat`) | auto-detect via `fstat`/sysfs |
+| `DMALLOC_FIXED_BASE` | Hex virtual address to `mmap` the region at (`MAP_FIXED_NOREPLACE`) | unset — OS/ASLR-chosen address |
+| `DMALLOC_BACKEND` | `generic` routes allocation through a vendored allocator (jemalloc/tcmalloc/cxlalloc/ralloc, selected at *compile* time) instead of the native slim heap | native slim heap |
+
+### C API quick reference
+
+```c
+#include "dmalloc.h"
+
+// Create a region over an already-open fd (POSIX shm, a regular file, or
+// a DAX device -- d_init() doesn't care which).
+int fd = shm_open("/my_pool", O_CREAT | O_RDWR, 0660);
+ftruncate(fd, 1 << 20);
+handle_t *h = d_init(fd, D_CREATE, /*key=*/0xCAFEu);
+
+// Publish -- allocate + name + copy-in, one atomic step.
+MyRoot root_data = { /* ... */ };
+d_publish(h, "graph_root", &root_data, sizeof(root_data), d_handle_key(h));
+
+// Discovery without mapping.
+if (d_lookup(h, "graph_root", 0)) { /* it exists and I can access it */ }
+
+// Attach -- resolves the name to a pointer inside h's existing mapping.
+MyRoot *root = (MyRoot *)d_attach(h, "graph_root", 0);
+
+// ... ordinary loads/stores through `root`, no further library calls ...
+
+d_detach(h, root);
+
+// Optional: confine this handle's own key to its current namespace/cgroup.
+d_namespace_bind(h, d_handle_key(h));
+
+// Rotate the key -- every other holder of the old key loses access lazily.
+d_revoke(h, "graph_root", /*host_id=*/1, /*new_key=*/0xBEEFu);
+
+d_delete(h, "graph_root", 0xBEEFu);
+d_deinit(h);
+```
+
+### Honest limits
+
+- **No resize primitive.** v2 had `shm_resize`; v0.3's literal primitive
+  table doesn't include one, and `d_publish` is copy-in-once. An object
+  that needs to grow in place (e.g. an append-only KV-cache) cannot be
+  supported faithfully — `d_delete` + re-`d_publish` under a new size
+  changes the pointer, which usually defeats the point. See
+  [WIP.md](WIP.md) for a real workload (PT-KVCache) this excludes.
+- **The 23-usable-character name limit is a hard rejection, not a soft
+  one.** Callers with longer natural names (arbitrary strings, hierarchical
+  keys) need an application-level short-alias scheme; the engine will not
+  do it for you.
+- **A key match is a bearer token, same as v0.2.** There is no
+  read/write distinction and, deliberately, no admin bypass — every
+  cooperating host must be provisioned with the exact same key out of
+  band. This was a direct fix for a real problem: an always-available
+  admin bypass (as v2's permission bitmask had) makes per-host identity
+  checks close to decorative, since two hosts using different keys can
+  still both succeed as long as either presents the bypass.
+- **`d_attach_slot`'s lock-freedom is a contract, not an enforced
+  invariant.** Nothing detects a concurrent writer; it is the caller's
+  responsibility to know the table is quiescent.
+
+---
+
 ## Running v2 code on the slim engine
 
 `shm_slim.h` additionally declares v2's exact public names and signatures —
@@ -1119,8 +1553,15 @@ include/
   shm_alloc.hpp      v2 C++ typed wrappers (shm::ptr<T>, make, cast, find, free)
   shm_cap.h          v2 C capability API (shm_cap_t, derive, deref, narrow, …)
   shm_cap.hpp        v2 C++ typed capability wrapper (shm::cap<T>)
-  shm_slim.h         v0.2 "slim" public API, PLUS a v2-compatible API section
-                     (see "Running v2 code on the slim engine" above)
+  shm_slim.h         v0.2/v0.3 shared engine's public API (region open/close,
+                     alloc/free/resize, name + namespace tables, slot-based
+                     parallel reads), PLUS a v2-compatible API section (see
+                     "Running v2 code on the slim engine" above)
+  dmalloc.h          v0.3 lifecycle API -- d_init/d_publish/d_lookup/
+                     d_attach/d_detach/d_revoke/d_delete/d_deinit, plus
+                     d_handle_key/d_namespace_bind/d_attach_slot/
+                     d_name_capacity. Layered entirely on shm_slim.h; adds
+                     no new on-disk state of its own.
 src/
   shm_internal.h     v2 internal layout types + inline helpers (shm_block_hdr_t, …)
   shm_persist.h      Cache-line flush / write-back helpers (shared by v2 and slim)
@@ -1128,14 +1569,19 @@ src/
   shm_cap.c          v2 CHERI-like capability layer (derive, deref, validate)
   shm_ns.h           Internal: IPC namespace + cgroup fingerprint decls (shared)
   shm_ns.c           Internal: /proc/self/ns/ipc inode + FNV-1a cgroup hash (shared)
-  shm_slim_internal.h v0.2 internal layout (16-byte shm_slim_hdr_t, name table, …)
-  shm_slim.c         v0.2 implementation -- self-contained, does not include
-                     shm_internal.h or shm_alloc.h
+  shm_slim_internal.h v0.2/v0.3 internal layout: 16-byte shm_slim_hdr_t,
+                     hash-indexed name table (open addressing + tombstones),
+                     the namespace-binding table (shm_slim_namespace_entry_t)
+  shm_slim.c         v0.2/v0.3 shared engine implementation -- self-contained,
+                     does not include shm_internal.h or shm_alloc.h
   shm_generic_backend.h  optional jemalloc/tcmalloc/cxlalloc/ralloc backend,
                      shared by shm_alloc.c and shm_slim.c
   shm_slim_compat.c  v2-compatible API bodies on the slim engine -- a
                      SEPARATE translation unit from shm_slim.c; never link
                      this alongside shm_alloc.o (duplicate shm_alloc()/etc.)
+  dmalloc.c          v0.3 implementation -- the eight lifecycle primitives
+                     plus d_handle_key/d_namespace_bind/d_attach_slot/
+                     d_name_capacity, all built on shm_slim.c's engine calls
 tests/
   test_basic.c       v2: open/close, alloc, lookup, permissions, multi-object,
                      parallel slot-partitioned directory reads
@@ -1147,12 +1593,21 @@ tests/
   test_slim_bounds.c v0.2: bad-offset/corrupted-header/corrupted-chain safety
   test_slim_scale.c  v0.2: proves the metadata-overhead claim, empirically and
                      via a projection at the motivating 300M-object scale
+  test_slim_namespace.c  v0.3 engine: d_namespace_bind-style bind/unbind/
+                     rebind/check, self-service-only binding, one-entry-per-key
   test_generic_backend.c  both: SHM_BACKEND_GENERIC / SHM_SLIM_BACKEND_GENERIC,
                      with and without a backend selected
   test_slim_v2compat.c  v2-compatible API section, running on the slim engine
+  test_dmalloc_basic.c  v0.3: the eight primitives end to end -- init, publish,
+                     lookup, attach, detach, revoke, delete, deinit
 Makefile
-WIP.md               v0.2 design rationale, decisions, and status log
-test-prog/           STREAM-style benchmarks; objstream_alloc.cpp is a real
-                     example of v2-style code running on the slim engine
-                     via the v2-compatible API (see WIP.md)
+WIP.md               design rationale, decisions, and status log for v0.2,
+                     v0.3, and every application ported onto either
+test-prog/           STREAM-style benchmarks and real application ports;
+                     objstream_alloc.cpp runs v2-style code on the slim
+                     engine via the v2-compatible API, while
+                     stream-namebound/ implements the same STREAM kernels
+                     natively on v0.3's d_init/d_publish/d_attach API,
+                     including the OpenMP-parallelized d_attach_slot
+                     discovery loop (see WIP.md)
 ```
