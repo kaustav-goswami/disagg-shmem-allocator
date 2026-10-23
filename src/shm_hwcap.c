@@ -187,3 +187,29 @@ int shm_hwcap_revoke(shm_hwcap_t *cap)
     }
     return rc;
 }
+
+int shm_hwcap_rotate(shm_hwcap_t *cap)
+{
+    if (!cap || cap->hw_token == SHM_HWCAP_TOKEN_NONE)
+        return EINVAL;
+
+    if (!g_bound || !g_ops.rotate_region)
+        return ENOSYS;
+
+    uint32_t old_token = cap->hw_token;
+    uint32_t new_token  = SHM_HWCAP_TOKEN_NONE;
+    int rc = g_ops.rotate_region(g_ops.ctx, old_token, &new_token);
+    if (rc != 0)
+        return rc;   /* old_token left bound to cap; nothing changed */
+
+    /* Update the free-hook tracking table in place: same obj_id, new token. */
+    for (uint32_t i = 0; i < HWCAP_TRACK_MAX; i++) {
+        if (g_track[i].used && g_track[i].token == old_token) {
+            g_track[i].token = new_token;
+            break;
+        }
+    }
+
+    cap->hw_token = new_token;
+    return 0;
+}

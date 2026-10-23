@@ -74,6 +74,17 @@
  * That adapter is out of scope for this repository (it depends on
  * CapCXL's runtime headers) — see the CapCXL integration section of the
  * top-level README for the exact wiring.
+ *
+ * Rotation as revocation
+ * ────────────────────────
+ * The hardware token is matched content-addressed (a CAM match against the
+ * backend's live table), not used as an array index — see shm_hwcap_mock.c.
+ * Revoking a capability therefore does not require a separate revocation
+ * bitmap: shm_hwcap_rotate() overwrites the registration's token with a
+ * fresh one, and the old token immediately and permanently stops matching
+ * anything, everywhere, with no cache anywhere in this design to go stale.
+ * This mirrors shm_cap_side_rotate() (shm_cap_side.h) exactly, and is meant
+ * to match the CapCXL CEU's own CEU_CMD_ROTATE semantics.
  */
 
 #ifndef SHM_HWCAP_H
@@ -155,6 +166,27 @@ typedef struct shm_hwcap_ops {
      */
     int (*verify_region)(void *ctx, uint32_t token, const void *ptr,
                          shm_hwcap_perm_t required_perms);
+
+    /**
+     * Rotate (revoke-by-replacement) the token bound to a registration:
+     * generate a fresh token for the same [ptr, ptr+size) region and
+     * permissions, such that @p old_token immediately and permanently stops
+     * matching anything -- no separate revocation bitmap, no sweep. This is
+     * the hardware-bridge counterpart of shm_cap_side_rotate() (see
+     * shm_cap_side.h) and of the CapCXL CEU's CEU_CMD_ROTATE.
+     *
+     * Presenting @p old_token is itself the authorization to rotate it,
+     * matching the bearer-key model used throughout: whoever holds the
+     * current token may rotate it, there is no separate admin capability.
+     *
+     * May be NULL if the backend does not support rotation, in which case
+     * shm_hwcap_rotate() returns ENOSYS.
+     *
+     * @return 0 on success (*out_token valid, old_token now invalid);
+     *         EINVAL if old_token is unknown/already rotated/revoked;
+     *         other errno-style codes on backend failure.
+     */
+    int (*rotate_region)(void *ctx, uint32_t old_token, uint32_t *out_token);
 } shm_hwcap_ops_t;
 
 /**
@@ -249,6 +281,28 @@ void *shm_hwcap_deref(const shm_region_t *region,
  *         code otherwise.
  */
 int shm_hwcap_revoke(shm_hwcap_t *cap);
+
+/**
+ * @brief Rotate the hardware token bound to @p cap (revoke-by-replacement).
+ *
+ * Unlike shm_hwcap_revoke(), this keeps the capability hardware-backed: the
+ * backend generates a fresh token for the same region and permissions, the
+ * old token stops matching anything immediately, and @p cap->hw_token is
+ * updated in place to the new value. Does not touch the software half
+ * (cap->sw) or free the underlying object.
+ *
+ * This is the primary revocation mechanism for the rotating-key design: to
+ * revoke every outstanding holder of a capability, rotate it once here, then
+ * distribute the new token only to whichever holders should keep access
+ * (key distribution itself is out of scope for this bridge -- see the
+ * project's design discussion on CXL.io-mediated key delivery).
+ *
+ * @return 0 on success; EINVAL if cap is NULL or already has no token;
+ *         ENOSYS if no backend with a rotate_region callback is installed;
+ *         the backend's own error code otherwise (cap->hw_token is left
+ *         unchanged on any failure).
+ */
+int shm_hwcap_rotate(shm_hwcap_t *cap);
 
 /** True if @p cap carries a live hardware token (not just a software cap). */
 static inline bool shm_hwcap_is_bound(shm_hwcap_t cap)

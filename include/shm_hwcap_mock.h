@@ -4,13 +4,16 @@
  *        shm_hwcap_ops_t (see shm_hwcap.h) entirely in userspace.
  *
  * This lets the hardware-capability bridge be exercised end-to-end —
- * register, verify, revoke, table exhaustion — without any CapCXL hardware
- * present. It is deliberately shaped after the real CEU: a fixed-size table
- * of (base, size, perms) slots addressed by a small integer token, mirroring
- * CapCXL's 64-entry shadow register file (see capcxl_pkg.sv,
- * SHADOW_REG_COUNT). A real CapCXL adapter and this mock are interchangeable
- * behind the same shm_hwcap_ops_t interface — swap one for the other by
- * changing which shm_hwcap_set_backend() call an application makes.
+ * register, verify, revoke, rotate, table exhaustion — without any CapCXL
+ * hardware present. It is deliberately shaped after the rotating-key CEU
+ * design: a fixed-size table of (base, size, perms, key) slots, matched by
+ * searching for a slot whose *key* equals the presented token (content-
+ * addressed, a CAM match) rather than by using the token as a direct array
+ * index — mirroring CapCXL's 64-entry shadow register file (see
+ * capcxl_pkg.sv, SHADOW_REG_COUNT) under its bearer-key revision. A real
+ * CapCXL adapter and this mock are interchangeable behind the same
+ * shm_hwcap_ops_t interface — swap one for the other by changing which
+ * shm_hwcap_set_backend() call an application makes.
  */
 
 #ifndef SHM_HWCAP_MOCK_H

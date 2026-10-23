@@ -22,6 +22,13 @@
  *  8. clear_backend_reverts_to_sw — after shm_hwcap_clear_backend(), stale
  *                                hw_token values are ignored and only the
  *                                software checks apply.
+ *  9. rotate_invalidates_old_token — shm_hwcap_rotate() makes the old token
+ *                                fail verify_region() immediately, while the
+ *                                new token (written into cap->hw_token)
+ *                                keeps working against the same region.
+ * 10. rotate_without_backend_enosys — with no backend (or one lacking
+ *                                rotate_region), shm_hwcap_rotate() reports
+ *                                ENOSYS and leaves cap->hw_token untouched.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -328,6 +335,72 @@ static void test_clear_backend_reverts_to_sw(void)
     PASS("clear_backend_reverts_to_sw");
 }
 
+/** 9. Rotating a token invalidates the old one immediately; the new one works. */
+static void test_rotate_invalidates_old_token(void)
+{
+    shm_hwcap_mock_t *mock = shm_hwcap_mock_create();
+    shm_hwcap_ops_t   ops  = shm_hwcap_mock_ops(mock);
+    shm_hwcap_set_backend(&ops);
+
+    shm_region_t *r = open_region();
+    uint64_t  id  = 0;
+    shm_off_t off = 0;
+    alloc_int(r, &id, &off);
+
+    shm_hwcap_t cap = shm_hwcap_derive(r, off, UID, PERMS, SHM_PERM_READ | SHM_PERM_WRITE);
+    CHECK(shm_hwcap_is_bound(cap));
+    uint32_t old_token = cap.hw_token;
+
+    CHECK(shm_hwcap_deref(r, cap, SHM_PERM_READ) != NULL);
+
+    int rc = shm_hwcap_rotate(&cap);
+    CHECK(rc == 0);
+    CHECK(shm_hwcap_is_bound(cap));
+    CHECK(cap.hw_token != old_token);
+
+    /* The old token, presented directly to the backend, no longer matches
+     * anything -- no window, no separate revocation step needed. */
+    CHECK(ops.verify_region(ops.ctx, old_token, NULL, SHM_HWCAP_PERM_READ) == EINVAL);
+
+    /* The capability (now carrying the new token) still works. */
+    CHECK(shm_hwcap_deref(r, cap, SHM_PERM_READ | SHM_PERM_WRITE) != NULL);
+
+    /* Table occupancy is unchanged by rotation -- same slot, new key. */
+    CHECK(shm_hwcap_mock_active_count(mock) == 1);
+
+    shm_region_close(r, true);
+    reset_backend();
+    shm_hwcap_mock_destroy(mock);
+    PASS("rotate_invalidates_old_token");
+}
+
+/** 10. A backend without rotate_region support: ENOSYS, token left untouched. */
+static void test_rotate_without_backend_enosys(void)
+{
+    shm_hwcap_mock_t *mock = shm_hwcap_mock_create();
+    shm_hwcap_ops_t   ops  = shm_hwcap_mock_ops(mock);
+    ops.rotate_region = NULL;   /* simulate a backend that doesn't support rotation */
+    shm_hwcap_set_backend(&ops);
+
+    shm_region_t *r = open_region();
+    uint64_t  id  = 0;
+    shm_off_t off = 0;
+    alloc_int(r, &id, &off);
+
+    shm_hwcap_t cap = shm_hwcap_derive(r, off, UID, PERMS, SHM_PERM_READ);
+    CHECK(shm_hwcap_is_bound(cap));   /* has a token -- register_region still works */
+    uint32_t token_before = cap.hw_token;
+
+    int rc = shm_hwcap_rotate(&cap);
+    CHECK(rc == ENOSYS);
+    CHECK(cap.hw_token == token_before);   /* untouched on failure */
+
+    shm_region_close(r, true);
+    reset_backend();
+    shm_hwcap_mock_destroy(mock);
+    PASS("rotate_without_backend_enosys");
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -342,6 +415,8 @@ int main(void)
     test_table_exhaustion_degrades();
     test_hw_denial_fails_deref();
     test_clear_backend_reverts_to_sw();
+    test_rotate_invalidates_old_token();
+    test_rotate_without_backend_enosys();
 
     printf("=== all hwcap tests passed ===\n");
     return 0;

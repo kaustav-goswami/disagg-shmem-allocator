@@ -47,9 +47,13 @@ LIB_OBJS_CAP = $(LIB_OBJS) $(BUILD)/shm_cap.o
 # exercise that bridge without real CapCXL hardware present.
 LIB_OBJS_HWCAP = $(LIB_OBJS_CAP) $(BUILD)/shm_hwcap.o $(BUILD)/shm_hwcap_mock.o
 
+# shm_cap_side.o is the side-metadata capability (variant a, shm_cap_side.h).
+# Independent of shm_cap.o / shm_hwcap.o -- only needs the base allocator.
+LIB_OBJS_SIDE = $(LIB_OBJS) $(BUILD)/shm_cap_side.o
+
 # ── Test binaries ────────────────────────────────────────────────────────────
 TESTS = $(BUILD)/test_basic $(BUILD)/test_resize $(BUILD)/test_multihost \
-        $(BUILD)/test_cap $(BUILD)/test_hwcap
+        $(BUILD)/test_cap $(BUILD)/test_hwcap $(BUILD)/test_cap_side
 
 .PHONY: all test clean
 
@@ -85,6 +89,13 @@ $(BUILD)/shm_hwcap_mock.o: src/shm_hwcap_mock.c include/shm_hwcap_mock.h \
                            include/shm_hwcap.h | $(BUILD)
 	$(CC) $(CFLAGS) -c src/shm_hwcap_mock.c -o $@
 
+# shm_cap_side.c implements the side-metadata capability (variant a); it
+# reads block headers via shm_internal.h the same way shm_cap.c does, but
+# does not depend on shm_cap.c/shm_cap.h at all.
+$(BUILD)/shm_cap_side.o: src/shm_cap_side.c include/shm_cap_side.h \
+                         src/shm_internal.h include/shm_alloc.h | $(BUILD)
+	$(CC) $(CFLAGS) -c src/shm_cap_side.c -o $@
+
 # ── Compile and link tests ────────────────────────────────────────────────────
 $(BUILD)/test_basic: tests/test_basic.c $(LIB_OBJS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_basic.c $(LIB_OBJS) $(LDFLAGS)
@@ -104,6 +115,11 @@ $(BUILD)/test_cap: tests/test_cap.c $(LIB_OBJS_CAP) | $(BUILD)
 $(BUILD)/test_hwcap: tests/test_hwcap.c $(LIB_OBJS_HWCAP) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/test_hwcap.c $(LIB_OBJS_HWCAP) $(LDFLAGS)
 
+# test_cap_side exercises the side-metadata capability (variant a); links
+# against LIB_OBJS_SIDE.
+$(BUILD)/test_cap_side: tests/test_cap_side.c $(LIB_OBJS_SIDE) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/test_cap_side.c $(LIB_OBJS_SIDE) $(LDFLAGS)
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 test: all
 	@echo "─── test_basic ──────────────────"
@@ -116,6 +132,8 @@ test: all
 	./$(BUILD)/test_cap
 	@echo "─── test_hwcap ───────────────────"
 	./$(BUILD)/test_hwcap
+	@echo "─── test_cap_side ────────────────"
+	./$(BUILD)/test_cap_side
 
 # ── Remove build artifacts ────────────────────────────────────────────────────
 clean:
@@ -133,3 +151,4 @@ clean:
 	-rm -f /dev/shm/shm_test_ns_enforce
 	-rm -f /dev/shm/test_cap_region
 	-rm -f /dev/shm/test_hwcap_region
+	-rm -f /dev/shm/test_cap_side_region
