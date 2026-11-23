@@ -36,7 +36,22 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Software back-invalidate hook (see shm_slim_internal.h) -- weak default,
+ *  a strong definition elsewhere in the final link overrides it.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#if defined(SHM_SLIM_SOFTWARE_BI)
+__attribute__((weak))
+void shm_slim_soft_bi(const void *hdr_addr, size_t hdr_len)
+{
+    (void)hdr_addr;
+    (void)hdr_len;
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Backing-fd sizing (POSIX regular files, and DAX character devices)
@@ -273,8 +288,10 @@ static void freelist_insert(shm_slim_region_t *r, shm_slim_hdr_t *b)
     shm_slim_region_hdr_t *rh   = shm_slim_rh(r);
     size_t                  b_ho = shm_slim_hoff_of_blk(r, b);
 
-    b->magic = SHM_SLIM_MAGIC_FREE;
-    b->key   = 0;
+    b->magic     = SHM_SLIM_MAGIC_FREE;
+    b->key       = 0;
+    b->timestamp = (uint64_t)time(NULL);
+    SHM_SLIM_BI_NOTIFY(b, sizeof(*b));
 
     uint64_t prev_lnk = 0;
     uint64_t cur_lnk  = rh->free_list;
@@ -827,8 +844,9 @@ int shm_slim_alloc(shm_slim_region_t *region,
         return ENOMEM;
     }
 
-    b->key   = key;
-    b->magic = want_name ? SHM_SLIM_MAGIC_LIVE_NAMED : SHM_SLIM_MAGIC_LIVE;
+    b->key       = key;
+    b->magic     = want_name ? SHM_SLIM_MAGIC_LIVE_NAMED : SHM_SLIM_MAGIC_LIVE;
+    b->timestamp = (uint64_t)time(NULL);
 
     size_t payload_cap = b->size - sizeof(shm_slim_hdr_t);
     memset((char *)b + sizeof(*b), 0, payload_cap);
@@ -836,6 +854,7 @@ int shm_slim_alloc(shm_slim_region_t *region,
     /* Persist the zero-initialized payload before exposing the live block. */
     shm_persist((char *)b + sizeof(*b), payload_cap);
     shm_persist(b, sizeof(*b));
+    SHM_SLIM_BI_NOTIFY(b, sizeof(*b));
 
     shm_off_t off = shm_slim_poff_of_blk(region, b);
 
@@ -1114,9 +1133,11 @@ int shm_slim_set_key(shm_slim_region_t *region, shm_off_t off,
         return EACCES;
     }
 
-    b->key = new_key;
+    b->key       = new_key;
+    b->timestamp = (uint64_t)time(NULL);
     shm_persist(b, sizeof(*b));
     shm_drain();
+    SHM_SLIM_BI_NOTIFY(b, sizeof(*b));
 
     region_unlock(region);
     return 0;

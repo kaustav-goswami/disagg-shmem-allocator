@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /**
  * d_init()'s signature is fixed at (fd, flag, key) by the source table --
@@ -122,9 +123,56 @@ static void *env_fixed_base(const char *var)
     return (void *)(uintptr_t)v;
 }
 
+/**
+ * Per-object access control (a tracked table of every attached pointer,
+ * checked either by a background thread or on demand -- the earlier
+ * design this replaced) turned out not to be worth its overhead: there is
+ * no way to check an individual object's key without either touching the
+ * data path on every access or maintaining a whole tracked-pointer table
+ * and sweeping it. A per-HANDLE time lease is the only version of this
+ * that's actually cheap -- one pair of timestamps, no table, no sweep,
+ * and d_attach()/d_detach() are completely unaware it exists (see their
+ * bodies below, and WIP.md for the fuller rationale).
+ *
+ * d_init() starts the lease (if DMALLOC_LEASE_DURATION_US is set --
+ * see env_lease_duration_ns() below); d_reinit(), already this project's
+ * "software forced key rotation" primitive, renews it as a side effect
+ * of every successful call. Checking it is d_lease_expired()'s entire
+ * job, and this library never calls that function itself, on any
+ * schedule -- deliberately lazy, matching every other opt-in knob here:
+ * zero cost unless the caller asks for it, and even then, one timestamp
+ * comparison.
+ */
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/**
+ * Same "signature has no room for this parameter" situation as
+ * DMALLOC_NAME_CAPACITY/DMALLOC_REGION_SIZE above: d_init(fd, flag, key)
+ * can't take a lease duration argument, so it's read from the
+ * environment instead. Unset or 0 disables leasing for this handle
+ * entirely -- d_lease_expired() then always reports false, and nothing
+ * else changes.
+ */
+static uint64_t env_lease_duration_ns(void)
+{
+    const char *s = getenv("DMALLOC_LEASE_DURATION_US");
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (!end || *end != '\0' || v == 0) return 0;
+    return (uint64_t)v * 1000ull;
+}
+
 struct handle {
     shm_slim_region_t *region;
     uint32_t            key;   /* this handle's own identity, set at d_init() */
+    uint64_t             lease_start_ns;    /* monotonic; 0 if leasing disabled */
+    uint64_t             lease_duration_ns; /* 0 -> leasing disabled for this handle */
 };
 
 uint32_t d_handle_key(const handle_t *handle)
@@ -214,6 +262,8 @@ handle_t *d_init(int fd, flags_t flag, uint32_t key)
     }
     h->region = region;
     h->key    = key;
+    h->lease_duration_ns = env_lease_duration_ns();
+    h->lease_start_ns    = h->lease_duration_ns ? monotonic_ns() : 0;
     return h;
 }
 
@@ -276,6 +326,37 @@ bool d_detach(handle_t *handle, void *ptr)
     size_t size;
     return shm_slim_block_size(handle->region, off, (shm_slim_key_t)handle->key,
                                &size) == 0;
+}
+
+bool d_reinit(handle_t *handle, uint32_t new_key)
+{
+    if (!handle)
+        return false;
+
+    /* Carry any namespace binding on the OLD key forward -- see dmalloc.h.
+     * Not fatal if this fails (e.g. new_key already independently bound
+     * to something else): the handle's own key still gets updated below,
+     * which is this call's primary effect. */
+    shm_slim_namespace_rebind(handle->region, (shm_slim_key_t)handle->key,
+                              (shm_slim_key_t)new_key);
+
+    handle->key = new_key;
+
+    /* Every successful reinit re-leases the handle, regardless of how
+     * much (or how little) of the previous lease had elapsed -- see the
+     * comment above env_lease_duration_ns(). A no-op when this handle
+     * was never leased in the first place (lease_duration_ns == 0). */
+    if (handle->lease_duration_ns)
+        handle->lease_start_ns = monotonic_ns();
+
+    return true;
+}
+
+bool d_lease_expired(handle_t *handle)
+{
+    if (!handle || !handle->lease_duration_ns)
+        return false;   /* leasing disabled for this handle -- never expires */
+    return monotonic_ns() - handle->lease_start_ns > handle->lease_duration_ns;
 }
 
 bool d_revoke(handle_t *handle, const char *name, int host_id, uint32_t new_key)

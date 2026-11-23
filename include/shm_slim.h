@@ -80,12 +80,25 @@ extern "C" {
 #define SHM_SLIM_MAGIC_REGION  0x53484D41u  /* "SHMA" */
 
 /**
- * On-disk format version for this module: the literal ASCII bytes "slim",
- * not an incrementing integer. This is what actually makes v0.2 and v2
- * regions mutually unreadable -- v2 checks for its own integer constant,
+ * On-disk format version for this module: the literal ASCII bytes "sli4",
+ * not an incrementing integer. This is what actually makes this format and
+ * v2 regions mutually unreadable -- v2 checks for its own integer constant,
  * this module checks for this word, and the two encodings cannot collide.
+ *
+ * Bumped from the original "slim" (0x736C696D) because shm_slim_hdr_t grew
+ * from 16 to 24 bytes (added a per-block `timestamp` field -- see
+ * shm_slim_internal.h). A region created under "slim" has a 16-byte block
+ * header throughout its heap; opening it with this "sli4" build would
+ * misinterpret every block's trailing 8 bytes as the next block's header.
+ * Rejecting the old stamp outright (ENOENT, same as any other version
+ * mismatch) is deliberately fail-closed rather than fail-silent.
+ *
+ * "sli4" (v0.4) deliberately also differs from the intermediate "sli3"
+ * stamp used by the v0.3-dev2 working builds, which shared this 24-byte
+ * block header: regions written by those builds are rejected too, so a
+ * v0.4 binary only ever opens regions written by a v0.4 build.
  */
-#define SHM_SLIM_VERSION       0x736C696Du  /* "slim" */
+#define SHM_SLIM_VERSION       0x736C6934u  /* "sli4" */
 
 /** Stored in every live/free heap block header. */
 #define SHM_SLIM_MAGIC_LIVE        0x534C4C41u  /* "SLLA": SLim Live Anonymous */

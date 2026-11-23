@@ -243,6 +243,11 @@ int d_attach_slot(handle_t *handle, uint32_t slot_index, flags_t flag,
  * @return       A valid handle on success; NULL on failure (bad fd, failed
  *               mmap, or -- when attaching -- a pool that fails validation
  *               or namespace/cgroup enforcement).
+ *
+ * If the environment variable DMALLOC_LEASE_DURATION_US is set (and
+ * non-zero), this handle also starts a time lease of that many
+ * microseconds -- see d_lease_expired() and d_reinit(). Unset or 0
+ * (the default) leaves this handle unleased, with zero added cost.
  */
 handle_t *d_init(int fd, flags_t flag, uint32_t key);
 
@@ -298,6 +303,68 @@ void *d_attach(handle_t *handle, const char *name, flags_t flag);
  * @return true if ptr was valid for this handle; false otherwise.
  */
 bool d_detach(handle_t *handle, void *ptr);
+
+/**
+ * @brief Query whether this handle's own time lease has expired.
+ *
+ * d_attach()/d_detach() only check a key at the moment they're called;
+ * every ordinary load/store through the pointer d_attach() returns is an
+ * ordinary CPU instruction that never consults this library again, by
+ * design (see the control-path/data-path split throughout this file).
+ * Checking that on every individual attached OBJECT (an earlier design
+ * this replaced) turned out not to be worth it -- there is no way to do
+ * that without either a per-object tracked-pointer table and a sweep, or
+ * touching the data path directly, and both cost more than this project
+ * is willing to spend. A time lease on the HANDLE itself is the cheap
+ * version of the same idea: d_init() starts a lease of length
+ * DMALLOC_LEASE_DURATION_US (env var, microseconds; unset or 0 disables
+ * leasing for that handle entirely -- default behavior, zero added
+ * cost), and d_reinit() -- already this project's "software forced key
+ * rotation" primitive -- renews it as a side effect of every successful
+ * call.
+ *
+ * This is deliberately lazy: nothing in this library calls
+ * d_lease_expired() automatically, on any schedule, and nothing crashes
+ * the process on its behalf. It costs one timestamp comparison, and nothing
+ * else exists between calls -- no background thread, no tracked table. It
+ * is entirely up to the caller to check it (however often fits their own
+ * workload) and decide what an expired lease means for them: call
+ * d_reinit() to renew it, exit, log, or ignore it.
+ *
+ * @return true if leasing is enabled for this handle (its lease duration
+ *         is non-zero) AND that duration has elapsed since d_init() or
+ *         the last successful d_reinit(); false if leasing was never
+ *         enabled for this handle, or the lease is still current.
+ */
+bool d_lease_expired(handle_t *handle);
+
+/**
+ * @brief Renew this handle's own (process-level) identity.
+ *
+ * Distinct from d_revoke(), which rotates a single OBJECT's key: this
+ * changes which key THIS handle presents on every subsequent call that
+ * doesn't explicitly override it. Existing objects previously published
+ * under the handle's OLD key are unaffected by this call alone -- they
+ * still require the old key, exactly as if a different handle held it --
+ * so a bare d_reinit() does not carry forward access to this handle's own
+ * prior objects; a caller that needs continuity must d_revoke() each such
+ * object to the new key itself.
+ *
+ * If the OLD key had an active namespace binding (d_namespace_bind()), it
+ * is carried forward to new_key automatically, mirroring d_revoke()'s
+ * existing behavior for object-level bindings -- otherwise a reinit would
+ * silently and unintentionally lift a namespace restriction the caller
+ * never asked to remove.
+ *
+ * If this handle was leased (see d_lease_expired()), a successful call
+ * also renews the lease -- d_reinit() IS this project's "re-lease"
+ * action, regardless of how much of the previous lease period had
+ * elapsed. A handle that was never leased is unaffected.
+ *
+ * @param new_key  The key this handle will act as from now on.
+ * @return         true on success; false only if handle is NULL.
+ */
+bool d_reinit(handle_t *handle, uint32_t new_key);
 
 /**
  * @brief Rotate a named object's access key.

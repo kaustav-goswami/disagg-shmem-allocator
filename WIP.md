@@ -2429,6 +2429,209 @@ removed, 54 modified** across `CMakeLists.txt`/`ShmBackend.cpp`/
 (`run_tpcc_shmem_benchmark.sh` 75 lines, `run_ycsb_shmem_benchmark.sh` 79
 lines, `test_tpcc_shmem.sh` 77 lines).
 
+## Revocation detection, take two: a handle-level time lease, not per-object access control
+
+The first attempt at closing this gap (kept below in git history, not in
+this file) tracked every individual `d_attach()`ed pointer in a
+process-local table and either swept it on a timer or exposed a manual
+per-pointer recheck -- see the previous section this replaced. It worked
+(verified directly, including a dedicated microbenchmark measuring
+detection latency down to sub-millisecond precision), but it wasn't worth
+what it cost: a tracked-pointer table plus a sweep (or an app that has to
+remember to call a per-pointer check) is real, ongoing bookkeeping for
+every attach, in exchange for a guarantee that, on reflection, is more
+than this project actually needs. There is no way to check an individual
+OBJECT's key without either touching the data path on every access or
+maintaining that table -- both cost more than they're worth here. A time
+lease is the only version of "detect a stale credential" that's actually
+cheap, and it only needs to exist at the HANDLE level, not per object.
+
+**The design**: `d_init()` starts a lease of `DMALLOC_LEASE_DURATION_US`
+microseconds (env var; unset or 0 -- the default -- disables leasing for
+that handle entirely, zero added cost). `d_reinit()` -- already this
+project's "software forced key rotation" primitive, unchanged from
+before -- renews it as a side effect of every successful call, regardless
+of how much of the previous lease period had elapsed. `d_lease_expired
+(handle)` is the query: one timestamp comparison
+(`monotonic_ns() - lease_start_ns > lease_duration_ns`), no thread, no
+table, no shared-memory access at all -- the lease lives entirely in the
+process-local `handle_t`. This library never calls it automatically, on
+any schedule, and nothing crashes the process on its behalf -- "for high
+performance mode, keep it lazy": it's entirely up to the caller to check
+it (however often fits their own workload) and decide what an expired
+lease means for them -- call `d_reinit()` to renew, exit, log, or ignore
+it.
+
+`d_attach()`/`d_detach()` are completely unaware any of this exists --
+reverted to their exact pre-lease bodies, byte for byte. This was a hard
+requirement, not just a simplification: whatever the enforcement
+mechanism, the whole point of the control-path/data-path split this
+project is built around is that ordinary attached-pointer loads/stores
+never consult this library again, and that must stay true regardless of
+which access-control scheme sits on top of it.
+
+Removed along with the old design: the per-object tracked-pointer table
+and its background sweep thread (`src/dmalloc_revalidate.c`/`.h`, both
+deleted), the `d_revalidate(handle, ptr)` public API (replaced by
+`d_lease_expired(handle)`), the `shm_slim_peek_key()` engine primitive
+(no longer has a caller -- the lease never touches shared memory or any
+object's key at all), and the `REVALIDATE=timer|manual` Makefile
+variable. No build flag replaces it: like `DMALLOC_FIXED_BASE`, a lease
+is two timestamps on a process-local struct, cheap enough to always
+compile in and gate purely by the environment variable (see
+`env_lease_duration_ns()`/`monotonic_ns()` in `src/dmalloc.c`).
+
+**Verification.** `make clean && make test` passes unchanged (leasing
+adds no code to any path the existing suite exercises unless
+`DMALLOC_LEASE_DURATION_US` is set, which it isn't there). A standalone
+probe: `d_lease_expired()` reports `false` immediately after `d_init()`
+with a 50ms lease; `true` 60ms later; `false` again immediately after
+`d_reinit()` (confirming renewal); `true` 60ms after that. With the env
+var unset, `d_lease_expired()` reports `false` at every one of those same
+checkpoints -- leasing genuinely costs nothing when not opted into.
+
+## `test-prog/bisnp-bench/`: publish/discover latency across hosts
+
+One microbenchmark, unaffected by the lease redesign above (it exercises
+`d_publish`/`d_attach` only, nothing revocation-related): host 1
+(`bisnp-publish`) publishes `object_count` named objects in a loop,
+timing each `d_publish()`. Host 2 (`bisnp-discover`) attaches every one of
+them concurrently, in a loop -- a genuinely separate, concurrently-running
+process (not sequential alloc-then-run like `objstream-alloc`/`-run` --
+the two are started together by `run_bisnp_bench.sh` and race for real) --
+reads and verifies each object's full payload, timing each attach+verify
+individually, and reports both a total wall-clock time and a per-object
+discover-latency distribution (mean/min/p95/p99/max). (This directory
+used to also hold a second microbenchmark measuring revocation-detection
+crash latency against a per-object access-control mechanism -- removed
+along with that mechanism, and the directory renamed from
+`revalidate-bench` to `bisnp-bench` to match what actually remains.)
+
+This design went through two real bugs and a full metric redesign, worth
+recording in order because each one only showed up once the previous fix
+was actually tried against real hardware:
+
+1. `d_publish()` makes a name visible in the table (`shm_slim_alloc`)
+   *before* it `memcpy()`s the caller's payload in (see `d_publish()` in
+   `src/dmalloc.c`) -- a discoverer fast enough to win that race can see
+   a name as present while its content is still zeroed. Fixed by spinning
+   on content (a magic number) for the `control` object, not just
+   presence, before trusting anything read from it.
+2. Every `d_lookup()`/`d_attach()` call serialises on `shm_slim`'s single,
+   process-shared region mutex. A *pure* busy-spin retry against an
+   object that genuinely isn't published yet hammers that same mutex the
+   publisher needs for every `d_publish()` call -- at 50,000 objects this
+   stalled the whole run for minutes. Fixed with a bounded tight-spin
+   (`kPollTightSpins = 2000` attempts, since real near-simultaneous
+   discovery usually resolves within the first few) that falls back to
+   `sched_yield()` between attempts once an object is taking unusually
+   long (`poll_backoff()` in `bisnp_bench_common.hpp`).
+3. The original design measured PER-OBJECT discover latency:
+   `t_discover - ctrl->publish_ts_ns[i]`, comparing host 2's attach time
+   against a publish-completion timestamp host 1 wrote into a shared
+   `control` object. That silently assumed the two `CLOCK_MONOTONIC`
+   readings came from the same clock -- true for two processes on one
+   host, false the moment host 1 and host 2 are two INDEPENDENT kernels
+   sharing memory over real or emulated CXL (two gem5 instances, two QEMU
+   guests, two physical hosts) -- which is the actual disaggregated-
+   memory scenario this whole project targets, and exactly the setup the
+   DAX path exists for. Each side's `CLOCK_MONOTONIC` then counts from
+   its own arbitrary boot reference, so the subtraction measured
+   boot-time skew, not propagation latency -- confirmed wrong in exactly
+   this way against a real CXL/DAX path.
+
+   The first fix attempted was a round-trip clock-offset calibration
+   (Cristian's algorithm, over the shared region instead of a network),
+   run once before the timed loops: the discoverer sends 16 timestamped
+   pings, the publisher echoes each back, and the round with the smallest
+   round-trip time gives an offset estimate to correct every
+   `publish_ts_ns[i]` with. This still didn't produce trustworthy
+   per-object numbers in practice -- residual calibration error at the
+   same scale as the thing being measured -- and it introduced its own
+   regression: `bisnp-publish` now blocked, unbounded, until a discoverer
+   showed up and completed every calibration round, breaking the common
+   case of running either binary STANDALONE just to confirm a DAX/CXL
+   region opens and sizes correctly (`./bisnp-publish 1 64` hung forever
+   with no partner running).
+
+   Rather than keep chasing clock-synchronization precision this
+   benchmark doesn't need, the cross-host comparison was dropped entirely
+   -- not the per-object metric itself. `bisnp-discover` now times each
+   object's attach-attempt-start to verify-done interval using ONLY its
+   own `monotonic_ns()` calls at both ends (never anything read from host
+   1's clock), and reports the resulting distribution
+   (mean/min/p95/p99/max) alongside a separate total wall-clock time for
+   the whole discover loop. "How long did it take THIS process to
+   discover this object" never needed a second clock in the first place,
+   and is correct on any host regardless of clock synchronization with
+   host 1 -- unlike "how long after HOST 1 published this object did HOST
+   2 discover it," which is what the original, removed metric actually
+   measured. This also let the header-only/full-memory compile-time split
+   go away entirely (there is now exactly one `bisnp-discover` binary,
+   which always attaches and reads/verifies the full payload) and
+   `bisnp-publish` no longer waits on a partner at all, so standalone
+   smoke-testing works again without any flag needed.
+
+`bisnp-discover`'s STARTUP waits -- for the region to exist, and for
+`bisnp-publish` to have published a valid `control` object -- are
+deliberately unbounded, with no timeout at all. This benchmark is meant
+to run with the two sides on independent gem5 instances, not just two
+processes on one host, and there is no bound on how far apart their
+relative wall-clock/simulated startup times can be -- a fixed startup
+timeout would produce a false failure there, not a real one. The
+per-object attach waits *inside* the main discovery loop keep their 30s
+timeout unchanged -- that one guards against an actual mid-run stall once
+both sides are already confirmed up, which is a real backstop, not a
+startup artifact.
+
+All timings are reported in **microseconds**, not nanoseconds --
+nanosecond precision implies a level of accuracy this benchmark, running
+over real or emulated CXL with its own scheduling/coherence jitter,
+doesn't actually have.
+
+Sample results (`run_bisnp_bench.sh`, 256-byte payloads, 3 trials/point,
+`graphs/bisnp_publish_discover.csv`):
+
+| object_count | publish mean (us) | discover total (us) | discover mean (us) | discover p95 (us) | discover p99 (us) |
+|---|---|---|---|---|---|
+| 100 | ~0.17 -- 0.29 | ~57 -- 74 | ~0.44 -- 0.51 | ~0.57 -- 1.34 | ~0.60 -- 1.57 |
+| 1,000 | ~1.08 -- 1.17 | ~1,602 -- 1,742 | ~1.41 -- 1.53 | ~3.47 -- 3.76 | ~4.45 -- 5.03 |
+| 10,000 | ~0.73 -- 0.82 | ~11,699 -- 12,624 | ~1.04 -- 1.12 | ~2.63 -- 3.48 | ~3.67 -- 4.65 |
+
+Payload verification never found a mismatch across any successful run
+(`verify_errors: 0` throughout). Discover total time scales roughly
+linearly with object_count, as expected for a loop that attaches and
+verifies one object at a time, while per-object mean/p95/p99 stay roughly
+flat across scale -- the per-object cost of a single attach+verify
+doesn't grow with how many other objects exist, only the total number of
+times it's paid does. Not every run succeeds cleanly -- this particular
+sweep hit the single-region-mutex contention described in bug 2 above on
+1 of 9 (object_count, trial) points and timed out rather than producing a
+number for that one; when that happens it's recorded honestly in the
+CSV's `status` column rather than hidden or silently retried, matching
+how `run_objstream_scaling.sh` treats the same category of thing under
+its own O(N^2) name-table cost.
+
+## Considered, not (yet) built: a cycle-accurate revocation-latency benchmark in a real CXL simulator
+
+The lease redesign above removed the only microbenchmark this project had
+for revocation/back-invalidation latency (it measured detection latency
+against the now-removed per-object mechanism specifically, so it no
+longer has anything to measure). A proposed replacement: run in an actual
+CXL cluster simulator (cxl-clustersim) rather than on POSIX shm/mmap on
+one machine, warm a region's cache lines from the host side, then time a
+`d_delete()`/unmap with `RDTSC` (or the simulator's own cycle counter) to
+get a genuine hardware-level back-invalidation-probe latency number,
+instead of the wall-clock, OS-scheduling-influenced numbers every
+microbenchmark in this file produces today.
+
+That's a meaningfully different kind of measurement than anything here so
+far -- cycle-accurate, single-host, hardware-probe latency, vs. this
+project's existing cross-process wall-clock latencies -- and needs a
+working cxl-clustersim integration this repo doesn't have yet (nothing
+under this name exists in the tree currently). Worth doing once that
+integration exists; not started here.
+
 ## Still pending on this branch
 
 - Remove v2 (`shm_alloc.*`, `shm_cap.*`, `shm_internal.h`, their tests,

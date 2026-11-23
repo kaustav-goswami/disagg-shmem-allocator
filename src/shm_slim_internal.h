@@ -37,19 +37,62 @@
 /* ── In-memory struct definitions ───────────────────────────────────────── */
 
 /**
- * Per-object heap block header. Exactly 16 bytes, always immediately
+ * Per-object heap block header. 24 bytes (was 16 before the `timestamp`
+ * field below was added -- see SHM_SLIM_VERSION), always immediately
  * preceding the payload -- see shm_slim.h for the full design rationale.
  */
 typedef struct shm_slim_hdr {
-    uint32_t magic;   /* SHM_SLIM_MAGIC_LIVE / _LIVE_NAMED / _FREE */
-    uint32_t key;     /* shm_slim_key_t; access-control token, 0 = open */
-    uint64_t size;    /* total block size (header + payload), aligned */
+    uint32_t magic;     /* SHM_SLIM_MAGIC_LIVE / _LIVE_NAMED / _FREE */
+    uint32_t key;       /* shm_slim_key_t; access-control token, 0 = open */
+    uint64_t size;      /* total block size (header + payload), aligned */
+    uint64_t timestamp; /* seconds since epoch, last time this header was
+                          * written (publish, revoke, or free) -- a leak
+                          * candidate is an object whose timestamp is old
+                          * relative to how long its region has existed;
+                          * this field only records the timestamp, it does
+                          * not itself reclaim anything */
 } shm_slim_hdr_t;
 
 /* The whole point of this format: a live object's fixed overhead must not
- * exceed a typical malloc chunk header. */
-_Static_assert(sizeof(shm_slim_hdr_t) == 16,
-               "shm_slim_hdr_t must be exactly 16 bytes");
+ * exceed a typical malloc chunk header by much. */
+_Static_assert(sizeof(shm_slim_hdr_t) == 24,
+               "shm_slim_hdr_t must be exactly 24 bytes");
+
+/**
+ * Software-enforced back-invalidate hook (compile-time opt-in via
+ * -DSHM_SLIM_SOFTWARE_BI). Called every time a block header is written --
+ * shm_slim_alloc() (publish), shm_slim_set_key() (revoke), and
+ * freelist_insert() (delete) -- with the address and length of exactly the
+ * header bytes that changed.
+ *
+ * This is a testing hook for running against a simulator that models both
+ * CXL back-invalidate modes:
+ *   - hardware-enforced: the simulated CXL device snoops every DAX write
+ *     automatically. dmalloc needs no code for this at all -- it is
+ *     already what happens when SHM_SLIM_SOFTWARE_BI is left undefined,
+ *     since the ordinary shm_persist() write is all real hardware would
+ *     ever see or need.
+ *   - software-enforced: the simulator instead expects software to
+ *     explicitly signal which address range just changed, since there is
+ *     no local instruction that can invalidate another host's cache --
+ *     that is exactly the gap real hardware BISnp closes. This hook is
+ *     that signal.
+ *
+ * shm_slim_soft_bi() itself is a weak no-op (defined in shm_slim.c); a
+ * simulator integration overrides it (provide a strong, non-weak
+ * definition of the same symbol in the final link, or replace the .o) to
+ * actually notify the fabric model. What that override does -- a memory
+ * write to a location the simulator watches, a magic/pseudo instruction
+ * the simulator's CPU model traps on, or something else entirely -- is
+ * intentionally not decided here: it depends on the specific simulator,
+ * which is outside this repository.
+ */
+#if defined(SHM_SLIM_SOFTWARE_BI)
+void shm_slim_soft_bi(const void *hdr_addr, size_t hdr_len);
+#define SHM_SLIM_BI_NOTIFY(addr, len)  shm_slim_soft_bi((addr), (len))
+#else
+#define SHM_SLIM_BI_NOTIFY(addr, len)  ((void)0)
+#endif
 
 /**
  * Region header -- lives at base[0]. O(1) per region, not per object, so it

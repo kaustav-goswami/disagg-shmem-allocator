@@ -25,6 +25,38 @@ else
   CACHE_FLAG =
 endif
 
+# ── Back-invalidate mode (optional, for testing against a CXL simulator) ──────
+#
+#   make BACK_INVALIDATE=software   dmalloc calls shm_slim_soft_bi() (weak,
+#                                    no-op by default -- a simulator
+#                                    integration overrides it) on every
+#                                    block-header write, requesting an
+#                                    explicit invalidate for that address
+#                                    range.
+#   make                 (default)  hardware mode: no extra code path.
+#                                    Every header write is an ordinary
+#                                    shm_persist() and nothing else --
+#                                    correct as long as the backing CXL
+#                                    device snoops writes and issues
+#                                    BISnp/back-invalidate automatically.
+#
+# See src/shm_slim_internal.h (SHM_SLIM_BI_NOTIFY) for the exact call sites.
+BACK_INVALIDATE ?=
+ifeq ($(BACK_INVALIDATE),software)
+  BI_FLAG = -DSHM_SLIM_SOFTWARE_BI
+else
+  BI_FLAG =
+endif
+
+# Handle-level access lease (d_lease_expired()/d_reinit()) needs no build
+# flag at all -- like DMALLOC_FIXED_BASE below, it's two timestamps on the
+# process-local handle_t, opt in purely via the DMALLOC_LEASE_DURATION_US
+# environment variable (see src/dmalloc.c and WIP.md). d_attach()/d_detach()
+# are completely unaware it exists; an earlier per-object design that DID
+# need a build flag (a background sweep over every tracked attached
+# pointer) was replaced by this because it cost too much for what it
+# bought -- see WIP.md.
+
 # ── Generic allocator backend (optional, pick at most one) ────────────────────
 #
 #   make GENERIC_ALLOC=jemalloc   SHM_BACKEND_GENERIC sources region memory
@@ -80,8 +112,8 @@ endif
 # -D_POSIX_C_SOURCE=200809L   unlocks shm_open, strdup, robust mutexes
 # -Wall -Wextra               enable common warnings
 # -g                          include debug symbols
-CFLAGS   = -std=c11   -Wall -Wextra -g -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc $(CACHE_FLAG) $(GENERIC_FLAG)
-CXXFLAGS = -std=c++17 -Wall -Wextra -g -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc $(CACHE_FLAG) $(GENERIC_FLAG)
+CFLAGS   = -std=c11   -Wall -Wextra -g -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc $(CACHE_FLAG) $(GENERIC_FLAG) $(BI_FLAG)
+CXXFLAGS = -std=c++17 -Wall -Wextra -g -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc $(CACHE_FLAG) $(GENERIC_FLAG) $(BI_FLAG)
 
 # Link with POSIX threads (-pthread), the real-time library (-lrt, for
 # shm_open), and whichever generic-allocator library was selected above.
